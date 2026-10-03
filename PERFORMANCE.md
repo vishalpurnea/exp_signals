@@ -66,6 +66,30 @@ under v1. The portfolio-level switcher remains clearly the worst approach
 under both engine versions — its much higher turnover (523 OOS trades vs.
 140 for the gated version) still looks like the likely culprit.
 
+**Tried the same entry gate on `trend_ladder` (Nifty 500, v2 engine) — a
+different kind of test, since `trend_ladder` already has a genuinely
+strong OOS result on its own, so the question was "does this help, or
+just get in the way."** It gets in the way, clearly:
+
+| | In-sample Sharpe | Out-of-sample Sharpe |
+|---|---|---|
+| `trend_ladder` (ungated) | 0.57 | 0.47 |
+| `dispersion_gated_trend_ladder` (threshold=0.5) | **-0.49** | 0.28 |
+
+Checked across every threshold from 0.3 to 0.6 — none come close to the
+ungated in-sample Sharpe (best is 0.10 at threshold=0.3); this isn't a
+tuning problem. The gate drops roughly half of `trend_ladder`'s trades
+(949 → 459 in-sample) and disproportionately removes the profitable ones
+(in-sample CAGR 13.04% → 1.04%) — the same whipsaw-shaped failure mode
+already documented for the Nifty-breakdown filter on this exact strategy
+(see `strategies/README.md`), just from a different regime signal. Net
+finding: dispersion-gating helps a strategy that's already struggling
+out-of-sample (`bollinger_reversion`) a little, and hurts a strategy
+that's already working (`trend_ladder`) a lot — it is not a
+universally-applicable fix, and whether it helps or hurts seems to track
+whether the base strategy needed rescuing in the first place, not
+anything about the gate itself.
+
 ## Nifty 500 (full universe)
 
 Confirmed via distinct symbols actually traded in the stored run, not just

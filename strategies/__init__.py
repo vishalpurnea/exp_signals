@@ -14,6 +14,7 @@ from strategies import (  # noqa: F401
     bollinger_breakout,
     bollinger_reversion,
     dispersion_gated_reversion,
+    dispersion_gated_trend_ladder,
     illiquidity_tilt,
     precision_pullback,
     regime_switching_allocator,
