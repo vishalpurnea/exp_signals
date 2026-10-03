@@ -13,11 +13,14 @@ from strategies.registry import available_strategies, get_strategy, register_str
 from strategies import (  # noqa: F401
     bollinger_breakout,
     bollinger_reversion,
+    dispersion_gated_reversion,
     illiquidity_tilt,
     precision_pullback,
+    regime_switching_allocator,
     rsi_mean_reversion,
     sma_crossover,
     trend_ladder,
+    volatility_premium,
 )
 
 __all__ = [
