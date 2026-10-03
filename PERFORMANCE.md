@@ -13,25 +13,43 @@ script's output) as of 2026-10-03 — see each strategy's own module docstring
 and `strategies/README.md` for the full methodology/caveats behind a number
 before trusting it in isolation.
 
-## ⚠ In-sample vs. out-of-sample — read before trusting any `illiquidity_tilt` row below
+## ⚠ In-sample vs. out-of-sample
 
-Every `illiquidity_tilt` number in this file (both tables below) is a
-**full-period** result — the same 2013-2026 window used to pick every one
-of its parameters, including the stop-loss. Splitting that period 80/20
-and running the exact current config on the out-of-sample 20% alone
-(2024-01-04 → 2026-09-25) tells a materially different story:
+Every strategy in this project was checked with the same 80/20 split
+(in-sample 2013-01-02 → 2024-01-03, out-of-sample 2024-01-04 → 2026-09-25).
+**The out-of-sample numbers below are v2-engine re-runs (2026-10-03, after
+PR #1 fixed the cash/N sizing, same-day execution order, and cost-rate
+bugs)** — the original v1-engine OOS checks (done BEFORE that fix, same
+day) showed a much more uniform, severe collapse across every strategy;
+re-running under v2 changed the picture substantially, not just the exact
+numbers:
 
-| | In-sample (2013–2024) | Out-of-sample (2024–2026) | OOS buy-and-hold |
-|---|---|---|---|
-| **Nifty 50** CAGR / Sharpe | 21.27% / 1.30 | 4.71% / **-0.14** | 9.52% / 0.31 |
-| **Nifty 500** CAGR / Sharpe | 23.98% / 1.68 | 6.11% / **0.06** | 14.68% / 0.53 |
+| Strategy | In-sample Sharpe (v2) | Out-of-sample Sharpe, v1 (original) | Out-of-sample Sharpe, v2 (re-run) | OOS buy-and-hold Sharpe |
+|---|---|---|---|---|
+| `trend_ladder` (Nifty 500) | 0.57 | 0.08 | **0.47** | 0.53 (Nifty 500) |
+| `illiquidity_tilt` (Nifty 50) | 1.36 | -0.14 | **0.21** | 0.31 (Nifty 50) |
+| `illiquidity_tilt` (Nifty 500) | 1.78 | 0.06 | **0.13** | 0.53 (Nifty 500) |
+| `bollinger_reversion` (Nifty 50) | 0.59 | -0.60 | **-0.36** | 0.31 (Nifty 50) |
+| `precision_pullback` (Nifty 500) | 0.81 | -0.77 | **-0.38** | 0.53 (Nifty 500) |
 
-Out-of-sample Sharpe is roughly zero or negative on both universes, and
-the strategy underperforms plain buy-and-hold on both CAGR and Sharpe —
-the full-period rows below should NOT be read as the expected forward
-performance of this strategy. See `candidates/illiquidity_tilt.md`'s
-"Critical review" section for the full writeup, including a quantified
-capacity/liquidity problem found on the Nifty 500 version.
+**Revised conclusion: part of the original "five strategies all collapse
+out-of-sample, pointing to a market-wide dispersion regime" finding was a
+measurement artifact of the v1 engine bug, not purely a real regime
+effect.** Under v2, `trend_ladder` now shows a genuinely strong,
+real-looking out-of-sample result (Sharpe 0.47, nearly matching its own
+in-sample 0.57, and close to buy-and-hold's own OOS Sharpe) —
+qualitatively different from "broken." `illiquidity_tilt` goes from
+negative/near-zero to weakly-but-genuinely positive on both universes.
+`bollinger_reversion` and `precision_pullback` are still negative
+out-of-sample, improved but not fixed. The dispersion-regime hypothesis
+(see `src/dispersion_regime.py`) and the two strategies built to test it
+(`dispersion_gated_reversion`, `regime_switching_allocator`, both in the
+"Rejected" table below) were built and tested entirely under the OLD v1
+engine — their negative results have NOT yet been re-checked under v2,
+and should not be read as settled given this update. The capacity/
+liquidity problem found on `illiquidity_tilt`'s Nifty 500 version (see
+`candidates/illiquidity_tilt.md`) is unaffected by the engine version and
+still applies.
 
 ## Nifty 500 (full universe)
 
