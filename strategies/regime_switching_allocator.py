@@ -19,6 +19,20 @@ strategy to extract right now, hold the market instead." This strategy
 tests reading (b) directly, as a genuinely different mechanism rather than
 a retuned version of the same one.
 
+RESULT, UPDATED 2026-10-03: both this strategy and the entry-gate version
+were originally tested under ``backtest.py``'s v1 engine. After PR #1
+fixed the engine's position-sizing/execution-order/cost bugs (v2),
+re-running the comparison flips the gate's verdict (see
+``dispersion_gated_reversion``'s own docstring: it goes from "slightly
+worse than ungated" to "a real, modest improvement") but does NOT flip
+this one's -- under v2 this is STILL clearly the worst out-of-sample
+result of every strategy in the project (Sharpe -0.93, vs. the gated
+version's -0.22 and the ungated baseline's -0.36), with turnover even
+higher under v2 (523 OOS trades) than it was under v1. Reading (b) above
+is therefore not supported by the v2 re-run either -- the portfolio-level
+switch specifically looks like the wrong mechanism, not just a
+v1-measurement casualty. See PERFORMANCE.md for the full table.
+
 MECHANISM: unlike every per-symbol-cycle strategy in this package
 (``bollinger_reversion``, ``dispersion_gated_reversion``), this one is
 architected like ``illiquidity_tilt``: a single GLOBAL ``held`` set,

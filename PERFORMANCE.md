@@ -41,15 +41,30 @@ in-sample 0.57, and close to buy-and-hold's own OOS Sharpe) —
 qualitatively different from "broken." `illiquidity_tilt` goes from
 negative/near-zero to weakly-but-genuinely positive on both universes.
 `bollinger_reversion` and `precision_pullback` are still negative
-out-of-sample, improved but not fixed. The dispersion-regime hypothesis
-(see `src/dispersion_regime.py`) and the two strategies built to test it
-(`dispersion_gated_reversion`, `regime_switching_allocator`, both in the
-"Rejected" table below) were built and tested entirely under the OLD v1
-engine — their negative results have NOT yet been re-checked under v2,
-and should not be read as settled given this update. The capacity/
-liquidity problem found on `illiquidity_tilt`'s Nifty 500 version (see
+out-of-sample, improved but not fixed. The capacity/liquidity problem
+found on `illiquidity_tilt`'s Nifty 500 version (see
 `candidates/illiquidity_tilt.md`) is unaffected by the engine version and
 still applies.
+
+**The two dispersion-regime strategies were re-run under v2, with a
+genuinely different (and more encouraging, for one of them) result than
+their original v1-based verdict:**
+
+| Strategy | In-sample Sharpe (v2) | OOS Sharpe, v1 (original) | OOS Sharpe, v2 (re-run) |
+|---|---|---|---|
+| `bollinger_reversion` (ungated baseline) | 0.59 | -0.60 | -0.36 |
+| `dispersion_gated_reversion` (entry gate) | 0.43 | -0.66 (worse than ungated) | **-0.22 (now better than ungated)** |
+| `regime_switching_allocator` (portfolio switch) | 0.67 | -1.29 (worst of all) | **-0.93 (still clearly the worst)** |
+
+Under v1, the entry-gate version looked slightly worse than doing nothing
+(-0.66 vs -0.60); under v2 it's a real, if modest, improvement over the
+ungated baseline (-0.22 vs -0.36) — a genuinely different conclusion, not
+just a different number. It's still negative and still underperforms
+buy-and-hold (Sharpe 0.31) out-of-sample, so this isn't a candidate yet,
+but the dispersion-gating idea is no longer a dead end the way it looked
+under v1. The portfolio-level switcher remains clearly the worst approach
+under both engine versions — its much higher turnover (523 OOS trades vs.
+140 for the gated version) still looks like the likely culprit.
 
 ## Nifty 500 (full universe)
 
@@ -88,8 +103,8 @@ later without remembering why it didn't work.
 | Strategy | Signal / horizon | In-sample | Out-of-sample | OOS buy-and-hold | Why rejected |
 |---|---|---|---|---|---|
 | `volatility_premium` (Nifty 50, window=20, top_quantile=0.2, holding=40d) | `volatility` (rolling 20d std of daily returns), 40d horizon chosen specifically because it was the ONE horizon (of 40d/60d) whose raw screening IC survived an in-sample/out-of-sample split (60d's stronger in-sample IC vanished entirely OOS) | CAGR 8.06%, Sharpe 0.24, max dd 25.17%, win 57.8%, 540 trades | CAGR 2.43%, Sharpe **-0.31**, max dd 15.11%, win 51.9%, 160 trades | CAGR 9.52%, Sharpe 0.31 | Even the one horizon whose raw IC survived out-of-sample (weakened to 0.021) wasn't a strong enough per-trade edge to produce a positive strategy-level Sharpe once actually traded — underperforms buy-and-hold on both CAGR and Sharpe out-of-sample. A different failure mode than `illiquidity_tilt`: not overfitting or capacity, just too weak a signal to trade profitably even when it's statistically real. |
-| `dispersion_gated_reversion` (Nifty 50, window=30, bottom_quantile=0.2, holding=30d, dispersion_high_threshold=0.5) | Same `bb_position` entry rule as `bollinger_reversion`, gated to only fire during a high-cross-sectional-dispersion regime (`src.dispersion_regime`) | CAGR 8.46%, Sharpe 0.29, max dd 24.86%, win 58.7%, 482 trades | CAGR 0.48%, Sharpe **-0.66**, 140 trades | CAGR 9.52%, Sharpe 0.31 | Built as a direct, first test of the dispersion-regime hypothesis (see the warning section above) — did NOT rescue the out-of-sample collapse: Sharpe (-0.66) is essentially the same as, if not slightly worse than, the ungated `bollinger_reversion`'s own OOS Sharpe (-0.60). A pre-committed `dispersion_high_threshold=0.5` was used (not cherry-picked after seeing this result) — an in-sample grid over 0.4/0.5/0.6 showed Sharpe falling monotonically as the threshold rose (0.43 → 0.29 → -0.08), itself a mildly concerning sign of sensitivity, not stability. |
-| `regime_switching_allocator` (Nifty 50, window=30, bottom_quantile=0.2, rebalance=21d, dispersion_high_threshold=0.5, max_concurrent_positions=50) | Portfolio-level version of the same hypothesis: hold the full universe (buy-and-hold) during low-dispersion regimes, switch to the `bb_position` bottom-quantile basket during high-dispersion regimes | CAGR 7.94%, Sharpe 0.35, max dd 9.09%, win 60.4%, 1,908 trades | CAGR **-0.39%**, Sharpe **-1.29** (worse than every other attempt), 506 trades | CAGR 9.52%, Sharpe 0.31 | Worst out-of-sample result of any strategy tried so far, despite the most in-sample-stable parameter sensitivity (Sharpe 0.13/0.35/0.31 across thresholds 0.4/0.5/0.6, not the gated version's sharp monotonic decline) and genuinely lower in-sample drawdown from real diversification during passive periods. Trade count (506 OOS, ~2-3x the other attempts) points to regime-flip-triggered rebalancing adding real whipsaw/cost drag on top of a more basic problem: this design correctly times WHEN to deploy the active `bb_position` basket, but can't fix the basket itself having no OOS edge (confirmed separately: `bollinger_reversion` alone is -0.60 Sharpe in this exact window) — correctly timing entry into a bet with no edge doesn't rescue it. Three independent operationalizations of the dispersion-regime hypothesis (entry gate, portfolio-level switch) have now failed to produce a working OOS strategy. `src/dispersion_regime.py` itself remains a sound, tested, reusable module — the hypothesis translation into a trading rule is what hasn't worked yet, not the regime measurement. |
+| `dispersion_gated_reversion` (Nifty 50) | **Moved out of this table (2026-10-03)** — re-run under the v2 engine (see the "In-sample vs. out-of-sample" section above) now shows a real, if modest, improvement over the ungated `bollinger_reversion` baseline (OOS Sharpe -0.22 vs -0.36), reversing the v1-based verdict that put it here. Not yet a candidate (still negative, still underperforms buy-and-hold), but no longer a dead end — kept here as a pointer, not a verdict. | — | — | — | — |
+| `regime_switching_allocator` (Nifty 50, window=30, bottom_quantile=0.2, rebalance=21d, dispersion_high_threshold=0.5, max_concurrent_positions=50) | Portfolio-level version of the same hypothesis: hold the full universe (buy-and-hold) during low-dispersion regimes, switch to the `bb_position` bottom-quantile basket during high-dispersion regimes | CAGR 7.94%, Sharpe 0.35 (v1) / 12.15% / 0.67 (v2), max dd 9.09%/14.61% | v1: CAGR -0.39%, Sharpe -1.29. **Re-run under v2 (2026-10-03): still the worst of every strategy tried, Sharpe -0.93**, 523 trades | CAGR 9.52%, Sharpe 0.31 | Confirmed under both engine versions: still clearly the worst out-of-sample result in the project. Its much higher turnover (523 OOS trades under v2 vs. 140 for the gated version) remains the leading explanation — regime-flip-triggered rebalancing adds real whipsaw/cost drag on top of timing entry into a basket (`bb_position`) that doesn't have a strong OOS edge either way. `src/dispersion_regime.py` itself remains a sound, tested, reusable module — this specific portfolio-switch application of it is the part that hasn't worked, under either engine. |
 
 ## No Nifty 500 run on record
 

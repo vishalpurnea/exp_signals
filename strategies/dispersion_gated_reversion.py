@@ -26,6 +26,19 @@ to -0.60 out-of-sample) -- that comparison is the actual test, run via
 ``validate_strategy.py`` the same way every other strategy's claim in this
 package has been checked, not assumed from the regime theory alone.
 
+RESULT, UPDATED 2026-10-03: this strategy and its ungated baseline were
+both originally tested under ``backtest.py``'s v1 engine (``cash / N``
+sizing), under which the gate looked slightly WORSE than doing nothing
+(OOS Sharpe -0.66 vs. the ungated version's -0.60). After PR #1 fixed the
+engine's position-sizing/execution-order/cost bugs (v2), re-running both
+under the same split gives a genuinely different answer: the gate is now
+a real, if modest, improvement over the ungated baseline (OOS Sharpe
+-0.22 vs. -0.36). Still negative, still underperforms buy-and-hold
+out-of-sample (Sharpe 0.31) -- this is NOT a production candidate -- but
+the dispersion-gating idea is no longer a dead end the way the v1 result
+suggested. See PERFORMANCE.md's "In-sample vs. out-of-sample" section for
+the full comparison table.
+
 ARCHITECTURE NOTE: unlike ``src.market_regime`` (which needs a separately
 fetched index history, attached via ``attach_market_regime`` by the
 caller before ``generate_signals`` ever runs), the dispersion regime is
