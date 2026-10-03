@@ -54,7 +54,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from strategies.base import SIGNAL_OUTPUT_COLUMNS, Strategy, StrategyConfig
+from strategies.base import SIGNAL_OUTPUT_COLUMNS, Strategy, StrategyConfig, first_exit_after_each_buy
 from strategies.registry import register_strategy
 
 
@@ -184,14 +184,14 @@ class TrendLadderStrategy(Strategy):
     below (yesterday's close was at/below it) — a fresh ladder rung, not day
     40 of an already-extended move; AND the Nifty 50 market-regime filter is
     bullish (see ``src.market_regime`` — inert if that data isn't attached
-    to the input). SELL when a bearish candle's close falls below the 20
-    EMA, OR unconditionally for every symbol on the one day the market
-    regime filter flags as a breakdown ("Nifty filter exit-all", the same
-    reason string the source spec's own tooling uses) — ``backtest.py``'s
-    engine already ignores a SELL for a symbol with no open position, so
-    this needs no per-symbol "is a position open" tracking here. Only
-    crossing/trigger *events* are emitted, matching every other strategy in
-    this package.
+    to the input). SELL on the first bearish candle closing below the 20
+    EMA after each BUY (not only on the day price crossed it), OR
+    unconditionally for every symbol on the one day the market regime
+    filter flags as a breakdown ("Nifty filter exit-all", the same reason
+    string the source spec's own tooling uses) — ``backtest.py``'s engine
+    ignores a SELL for a symbol with no open position. Only trigger
+    *events* are emitted, never a row per day: one normal exit per entry,
+    plus the exit-all SELL for every symbol on a breakdown day.
 
     See this module's docstring for what's deliberately not implemented
     (laddering, risk-based sizing/hard stops) and why — those are
@@ -336,20 +336,22 @@ class TrendLadderStrategy(Strategy):
             & nifty_bullish
         )
 
-        # Crossing event, not a persistent state: yesterday's close was at/above
-        # the 20 EMA, today's is a bearish candle closing below it. Without the
-        # "yesterday >= EMA20" gate this would re-fire on every bearish day
-        # during an extended stretch already below the EMA, which the shared
-        # backtest engine happens to no-op (no open position to close) but
-        # would still bloat the signals table and violate the "events, not a
-        # HOLD/state row for every day" convention every strategy here follows.
+        # The exit is "a bearish candle closes below the 20 EMA" -- not
+        # necessarily on the day price crossed it (a gap below on a bull candle,
+        # then a bearish close the next day, is still an exit). To keep SELLs as
+        # one-off events rather than a row for every bearish day below the EMA,
+        # a SELL is emitted only on the FIRST qualifying day after a BUY. BUYs
+        # are never suppressed, so whenever the engine holds a position the last
+        # BUY since the previous SELL has armed exactly one exit.
         # The Nifty-breakdown exit fires unconditionally (every symbol, not
-        # just ones with an EMA-20 cross that day) -- excluded from the
-        # "normal" mask so a symbol never gets two SELL rows on the same date.
+        # just ones with an armed exit) -- excluded from the "normal" mask so a
+        # symbol never gets two SELL rows on the same date.
         bearish_candle = raw_close < raw_open
-        normal_sell_mask = (
-            valid_event & (prev_price >= prev_ema_20) & bearish_candle & (price < data["ema_20"])
-        ) & ~nifty_breakdown
+        exit_condition = (valid_event & bearish_candle & (price < data["ema_20"])).to_numpy()
+        normal_sell_mask = pd.Series(
+            first_exit_after_each_buy(buy_mask.to_numpy(), exit_condition, nifty_breakdown.to_numpy()),
+            index=data.index,
+        )
         sell_mask = normal_sell_mask | nifty_breakdown
 
         rows: list[dict[str, object]] = []

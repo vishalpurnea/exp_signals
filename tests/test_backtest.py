@@ -168,59 +168,57 @@ def test_t_plus_1_execution_timing(monkeypatch):
 
 
 def test_transaction_cost_calculation():
-    """calculate_transaction_cost() matches its own documented STT/exchange/
-    SEBI/GST/stamp-duty formula exactly, for both BUY and SELL.
+    """calculate_transaction_cost() reproduces a broker's own numbers, not a
+    restatement of its own formula.
 
-    Would catch: a wrong rate constant, GST computed on the wrong base,
-    stamp duty leaking into SELL trades (or missing from BUY trades -- it is
-    documented as buy-side only), or a case-sensitive side check.
+    Expected totals come from Upstox's brokerage calculator (GET
+    /v2/charges/brokerage, NSE equity delivery, queried 2026-10) for the
+    exact trade values below, plus the depository (DP) charge that the
+    calculator lists separately as a flat Rs 20 per delivery sell. GST also
+    applies to DP: a real FY2026-27 Upstox equity contract note's GST (96.41)
+    equals 18% of transaction + SEBI + DP + brokerage. So every SELL adds
+    20 * 1.18 = 23.60 to the calculator's total.
+
+    Would catch: a stale exchange rate, GST on the wrong base, stamp duty on
+    SELLs or missing from BUYs, a missing or BUY-side DP charge, or a
+    case-sensitive side check.
     """
-    # Hand-computed expected values (trade_value * rate, summed per the
-    # docstring's formula):
-    #   BUY  100000: stt=100 + exch=3.45 + sebi=0.1 + gst=0.621 + stamp=15   = 119.171
-    #   SELL 100000: stt=100 + exch=3.45 + sebi=0.1 + gst=0.621 + stamp=0    = 104.171
-    #   BUY   50000: stt=50  + exch=1.725+ sebi=0.05+ gst=0.3105+ stamp=7.5  =  59.5855
-    #   SELL  50000: stt=50  + exch=1.725+ sebi=0.05+ gst=0.3105+ stamp=0    =  52.0855
-    assert calculate_transaction_cost(100_000.0, "BUY") == pytest.approx(119.171, rel=1e-9)
-    assert calculate_transaction_cost(100_000.0, "SELL") == pytest.approx(104.171, rel=1e-9)
-    assert calculate_transaction_cost(50_000.0, "BUY") == pytest.approx(59.5855, rel=1e-9)
-    assert calculate_transaction_cost(50_000.0, "SELL") == pytest.approx(52.0855, rel=1e-9)
-
-    # Independent reference implementation of the same documented formula,
-    # cross-checked against a wider set of trade values.
-    def expected_cost(trade_value: float, side: str) -> float:
-        stt = trade_value * 0.001
-        exchange_charges = trade_value * 0.0000345
-        sebi_charges = trade_value * 0.000001
-        gst = exchange_charges * 0.18  # brokerage is 0
-        stamp_duty = trade_value * 0.00015 if side == "BUY" else 0.0
-        return stt + exchange_charges + sebi_charges + gst + stamp_duty
-
-    for trade_value in (1_000.0, 25_000.0, 250_000.0, 1_000_000.0):
-        for side in ("BUY", "SELL"):
-            assert calculate_transaction_cost(trade_value, side) == pytest.approx(
-                expected_cost(trade_value, side), rel=1e-9
-            )
+    dp_with_gst = 20.0 * 1.18
+    broker_quotes = [
+        # (trade_value, side, Upstox calculator total excluding DP)
+        (1_000.0, "SELL", 1.04),
+        (50_000.0, "BUY", 59.38),
+        (50_000.0, "SELL", 51.88),
+        (100_000.0, "BUY", 118.74),
+        (100_000.0, "SELL", 103.74),
+        (1_000_000.0, "SELL", 1037.41),
+    ]
+    for trade_value, side, broker_total in broker_quotes:
+        expected = broker_total + (dp_with_gst if side == "SELL" else 0.0)
+        # The calculator rounds each component to the paisa.
+        assert calculate_transaction_cost(trade_value, side) == pytest.approx(expected, abs=0.02)
 
     # side must not be case-sensitive.
     assert calculate_transaction_cost(100_000.0, "buy") == pytest.approx(
         calculate_transaction_cost(100_000.0, "BUY")
+    )
+    assert calculate_transaction_cost(100_000.0, "sell") == pytest.approx(
+        calculate_transaction_cost(100_000.0, "SELL")
     )
 
 
 def test_multiple_concurrent_positions_capital_allocation(monkeypatch):
     """3 symbols BUY on the same day at the same price, max_concurrent_positions=3.
 
-    Equal-weight sizing recomputes `cash / max_concurrent_positions` from
-    *current* cash for every fill (per run_backtest's own docstring), not a
-    fixed pre-split budget -- so within one day, the alphabetically-first
-    symbol (per _schedule_executions's sort) gets a full 1/3 of capital, the
-    next gets 1/3 of what's left, etc. This pins down that exact sequential
-    result by hand.
+    Equal-weight sizing targets ``equity / max_concurrent_positions``, with
+    equity marked at the previous close (initial capital on the first day),
+    capped by the cash actually available. All three fills share the same
+    target, so each gets a full 1/3 regardless of the order they execute in.
 
-    Would catch: a double-spend bug (each position computing its share of
-    the *original* capital independently, letting total allocation exceed
-    initial_capital) or a sizing divisor that ignores max_concurrent_positions.
+    Would catch: a double-spend bug (total allocation exceeding
+    initial_capital), a sizing divisor that ignores max_concurrent_positions,
+    or sizing from *remaining cash* (which gives later fills on the same day
+    1/3 of a shrinking balance: 1000, 666, 444 shares here).
     """
     _zero_cost(monkeypatch)
 
@@ -255,21 +253,277 @@ def test_multiple_concurrent_positions_capital_allocation(monkeypatch):
         [run_id],
     ).df()
 
-    # Hand-computed sequential allocation (fill_price = 100 for all three):
-    #   AAA: alloc = 300000/3 = 100000.00 -> qty = int(100000.00/100) = 1000, value=100000, cash -> 200000
-    #   BBB: alloc = 200000/3 =  66666.67 -> qty = int( 66666.67/100) =  666, value= 66600, cash -> 133400
-    #   CCC: alloc = 133400/3 =  44466.67 -> qty = int( 44466.67/100) =  444, value= 44400, cash ->  89000
-    expected_quantity = {"AAA": 1000, "BBB": 666, "CCC": 444}
+    # Hand-computed (fill_price = 100 for all three): target = 300000/3 = 100000
+    # for each, cash 300000 -> 200000 -> 100000 -> 0, never short of the target.
+    expected_quantity = {"AAA": 1000, "BBB": 1000, "CCC": 1000}
     for _, row in trades.iterrows():
         assert row["quantity"] == expected_quantity[row["symbol"]]
         assert row["entry_price"] == pytest.approx(100.0)
 
     total_allocated = float((trades["quantity"] * trades["entry_price"]).sum())
-    assert total_allocated == pytest.approx(100_000 + 66_600 + 44_400)
+    assert total_allocated == pytest.approx(300_000)
     # The double-spend guard: total allocated across all positions opened on
     # the same day must never exceed initial_capital.
     assert total_allocated <= 300_000
 
+    conn.close()
+
+
+def test_position_size_follows_marked_equity_not_remaining_cash(monkeypatch):
+    """Two slots, 200000 capital. AAA fills at 100 (target 200000/2 = 100000
+    -> 1000 shares, cash 100000 left) and closes that day at 50, so equity at
+    the close is 100000 + 1000*50 = 150000. BBB's BUY fills the next morning
+    at 100: its target is 150000/2 = 75000 -> 750 shares. AAA closes at 70
+    on the fill day itself, which the engine cannot know at the open.
+
+    Would catch: sizing from remaining cash (100000/2 -> 500 shares), which
+    shrinks every later position as more slots fill, or marking equity at the
+    fill day's own close (170000/2 -> 850 shares), a price not yet known.
+    """
+    _zero_cost(monkeypatch)
+
+    conn = _make_conn()
+    strategy = "test_strategy"
+    _insert_ohlcv(conn, "AAA", [("2024-01-01", 100, 100), ("2024-01-02", 100, 50), ("2024-01-03", 50, 70)])
+    _insert_ohlcv(conn, "BBB", [("2024-01-01", 100, 100), ("2024-01-02", 100, 100), ("2024-01-03", 100, 100)])
+    _insert_signal(conn, "AAA", "2024-01-01", strategy, "BUY")
+    _insert_signal(conn, "BBB", "2024-01-02", strategy, "BUY")
+
+    run_id = run_backtest(
+        conn,
+        strategy_name=strategy,
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+        initial_capital=200_000,
+        slippage_pct=0.0,
+        symbols=["AAA", "BBB"],
+        max_concurrent_positions=2,
+    )
+
+    quantity = dict(
+        conn.execute("SELECT symbol, quantity FROM backtest_trades WHERE run_id = ?", [run_id]).fetchall()
+    )
+    assert quantity == {"AAA": 1000, "BBB": 750}
+
+    conn.close()
+
+
+def test_position_size_is_capped_by_available_cash(monkeypatch):
+    """Two slots, 100000 capital. AAA fills at 100 (target 50000 -> 500
+    shares, cash 50000 left) and closes at 200, so equity is 150000 and
+    BBB's target is 75000 -- but only 50000 of cash is left. BBB must buy
+    what the cash affords (500 shares at 100), not be skipped.
+
+    Would catch: the target ignoring available cash (a 750-share order that
+    the debit guard then rejects, losing the entry).
+    """
+    _zero_cost(monkeypatch)
+
+    conn = _make_conn()
+    strategy = "test_strategy"
+    _insert_ohlcv(conn, "AAA", [("2024-01-01", 100, 100), ("2024-01-02", 100, 200), ("2024-01-03", 200, 200)])
+    _insert_ohlcv(conn, "BBB", [("2024-01-01", 100, 100), ("2024-01-02", 100, 100), ("2024-01-03", 100, 100)])
+    _insert_signal(conn, "AAA", "2024-01-01", strategy, "BUY")
+    _insert_signal(conn, "BBB", "2024-01-02", strategy, "BUY")
+
+    run_id = run_backtest(
+        conn,
+        strategy_name=strategy,
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+        initial_capital=100_000,
+        slippage_pct=0.0,
+        symbols=["AAA", "BBB"],
+        max_concurrent_positions=2,
+    )
+
+    quantity = dict(
+        conn.execute("SELECT symbol, quantity FROM backtest_trades WHERE run_id = ?", [run_id]).fetchall()
+    )
+    assert quantity == {"AAA": 500, "BBB": 500}
+
+    conn.close()
+
+
+def test_sizing_survives_a_held_symbol_with_no_known_close_yet(monkeypatch):
+    """AAA fills on 2024-01-02 but has no non-null close until 2024-01-03,
+    so the 2024-01-02 mark-to-market equity is NaN. BBB's entry that next
+    morning must still be sized (from the last finite equity, 100000/2 ->
+    500 shares) instead of crashing on int(NaN).
+
+    Would catch: a NaN equity mark reaching the quantity calculation.
+    """
+    _zero_cost(monkeypatch)
+    price_df = pd.DataFrame(
+        {
+            "symbol": ["AAA"] * 3 + ["BBB"] * 3,
+            "date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"] * 2),
+            "open": [100.0] * 6,
+            "close": [np.nan, np.nan, 100.0, 100.0, 100.0, 100.0],
+        }
+    )
+    signals = pd.DataFrame(
+        {
+            "symbol": ["AAA", "BBB"],
+            "date": pd.to_datetime(["2024-01-01", "2024-01-02"]),
+            "signal_type": ["BUY", "BUY"],
+        }
+    )
+    price_index = backtest._build_price_index(price_df)
+    close_matrix = price_df.pivot(index="date", columns="symbol", values="close").sort_index().ffill()
+    scheduled = backtest._schedule_executions(signals, price_index)
+
+    trades, _, _ = backtest._simulate(scheduled, price_index, close_matrix, 100_000, 0.0, 2)
+
+    assert {t["symbol"]: t["quantity"] for t in trades} == {"AAA": 500, "BBB": 500}
+
+
+def test_buy_is_shrunk_to_fit_cash_after_costs_not_skipped():
+    """One slot, 100000 capital, real transaction costs. The target is the
+    whole 100000, but 1000 shares at 100 plus buy-side costs (~0.119%) would
+    need ~100119 of cash. The buy must shrink to the largest quantity whose
+    value plus costs fits: 998 shares (998*100 + 118.50 = 99918.50; 999
+    shares would need 100018.62).
+
+    Would catch: a BUY being skipped outright whenever the target allocation
+    leaves no room for costs (with one slot, every single entry), or cash
+    going negative because costs were left out of the fit.
+    """
+    conn = _make_conn()
+    strategy = "test_strategy"
+    _insert_ohlcv(conn, "AAA", [("2024-01-01", 100, 100), ("2024-01-02", 100, 100), ("2024-01-03", 100, 100)])
+    _insert_signal(conn, "AAA", "2024-01-01", strategy, "BUY")
+
+    run_id = run_backtest(
+        conn,
+        strategy_name=strategy,
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+        initial_capital=100_000,
+        slippage_pct=0.0,
+        symbols=["AAA"],
+        max_concurrent_positions=1,
+    )
+
+    trade = conn.execute(
+        "SELECT quantity, entry_price, entry_cost FROM backtest_trades WHERE run_id = ?", [run_id]
+    ).df()
+    assert len(trade) == 1
+    row = trade.iloc[0]
+    assert row["quantity"] == 998
+    assert row["quantity"] * row["entry_price"] + row["entry_cost"] <= 100_000
+
+    conn.close()
+
+
+def test_same_day_sell_frees_its_slot_before_buys_execute(monkeypatch):
+    """One slot. ZZZ is held; its SELL and AAA's BUY both execute at the
+    2024-01-03 open. A real trader's orders are independent of ticker
+    spelling: the exit frees the slot and its cash for the entry that
+    morning. AAA must fill at 100 with the full equity, ZZZ exit at 120.
+
+    Would catch: executions on a day running in alphabetical order with BUYs
+    and SELLs interleaved, so AAA (sorted before ZZZ) finds the slot still
+    taken and is skipped -- an entry lost purely because of its name.
+    """
+    _zero_cost(monkeypatch)
+
+    conn = _make_conn()
+    strategy = "test_strategy"
+    _insert_ohlcv(conn, "ZZZ", [("2024-01-01", 100, 100), ("2024-01-02", 100, 110), ("2024-01-03", 120, 120)])
+    _insert_ohlcv(conn, "AAA", [("2024-01-01", 100, 100), ("2024-01-02", 100, 100), ("2024-01-03", 100, 100)])
+    _insert_signal(conn, "ZZZ", "2024-01-01", strategy, "BUY")
+    _insert_signal(conn, "ZZZ", "2024-01-02", strategy, "SELL")
+    _insert_signal(conn, "AAA", "2024-01-02", strategy, "BUY")
+
+    run_id = run_backtest(
+        conn,
+        strategy_name=strategy,
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+        initial_capital=100_000,
+        slippage_pct=0.0,
+        symbols=["AAA", "ZZZ"],
+        max_concurrent_positions=1,
+    )
+
+    trades = conn.execute(
+        "SELECT symbol, entry_date, entry_price, quantity, exit_reason FROM backtest_trades "
+        "WHERE run_id = ? ORDER BY symbol",
+        [run_id],
+    ).df()
+    assert list(trades["symbol"]) == ["AAA", "ZZZ"]
+    aaa = trades.iloc[0]
+    assert pd.Timestamp(aaa["entry_date"]) == pd.Timestamp("2024-01-03")
+    assert aaa["entry_price"] == pytest.approx(100.0)
+    # Equity at the 2024-01-02 close: 1000 ZZZ shares * 110 = 110000.
+    assert aaa["quantity"] == 1100
+    assert trades.iloc[1]["exit_reason"] == "SIGNAL"
+
+    conn.close()
+
+
+def test_affordable_quantity_holds_under_a_flat_buy_fee(monkeypatch):
+    """With a flat Rs 50 fee per BUY, the proportional estimate at the
+    budget's size (rate = 50/1000 = 5%) gives floor(1000 / 1.05) = 952
+    shares at Rs 1, whose debit 952 + 50 = 1002 exceeds the 1000 budget.
+    The quantity must step down to 950 (950 + 50 = 1000).
+
+    Would catch: sizing that treats the cost function as a pure percentage,
+    which overspends the budget as soon as any fee is flat.
+    """
+    monkeypatch.setattr(
+        backtest, "calculate_transaction_cost", lambda trade_value, side: 50.0 if side == "BUY" else 0.0
+    )
+    assert backtest._affordable_quantity(1000.0, 1.0) == 950
+    assert backtest._affordable_quantity(40.0, 1.0) == 0
+
+
+def test_runs_record_the_engine_version(monkeypatch):
+    """Every stored run carries backtest.ENGINE_VERSION, so runs from before
+    and after an engine change (sizing, ordering, costs) can be told apart
+    in backtest_runs.
+
+    Would catch: the version not being written, or being written as a
+    constant other than ENGINE_VERSION.
+    """
+    _zero_cost(monkeypatch)
+    conn = _make_conn()
+    _insert_ohlcv(conn, "AAA", [("2024-01-01", 100, 100), ("2024-01-02", 100, 100)])
+    _insert_signal(conn, "AAA", "2024-01-01", "test_strategy", "BUY")
+
+    run_id = run_backtest(
+        conn, strategy_name="test_strategy", start_date="2024-01-01", end_date="2024-01-02",
+        initial_capital=100_000, slippage_pct=0.0, symbols=["AAA"], max_concurrent_positions=1,
+    )
+
+    version = conn.execute("SELECT engine_version FROM backtest_runs WHERE run_id = ?", [run_id]).fetchone()[0]
+    assert version == backtest.ENGINE_VERSION
+    conn.close()
+
+
+def test_schema_upgrade_adds_engine_version_and_keeps_old_runs():
+    """A backtest_runs table created before engine_version existed gains the
+    column; its existing rows read NULL (= recorded by an older engine).
+
+    Would catch: the upgrade failing on an existing database, or old rows
+    being back-filled with the current version (mislabelling old results).
+    """
+    conn = duckdb.connect(":memory:")
+    conn.execute(
+        """
+        CREATE TABLE backtest_runs (
+            run_id VARCHAR NOT NULL PRIMARY KEY, strategy_name VARCHAR NOT NULL,
+            start_date DATE NOT NULL, end_date DATE NOT NULL, initial_capital DOUBLE NOT NULL,
+            position_sizing VARCHAR NOT NULL, created_at TIMESTAMP DEFAULT current_timestamp
+        )
+        """
+    )
+    conn.execute("INSERT INTO backtest_runs VALUES ('old', 's', '2024-01-01', '2024-01-02', 1, 'equal_weight', NULL)")
+
+    backtest.ensure_backtest_schema(conn)
+
+    assert conn.execute("SELECT engine_version FROM backtest_runs WHERE run_id = 'old'").fetchone()[0] is None
     conn.close()
 
 

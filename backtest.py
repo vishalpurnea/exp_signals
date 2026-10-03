@@ -12,17 +12,34 @@ from src.universe import get_active_universe
 
 DEFAULT_DB_PATH: Path = Path("data/trading_data.duckdb")
 
+# Stored on every backtest_runs row so results from different engine
+# semantics are never compared by accident. NULL = recorded before this
+# column existed (cash / N sizing, interleaved same-morning fills, older
+# cost model). 2 = equity-based sizing, sells before buys, broker-checked costs.
+ENGINE_VERSION: int = 2
+
+# Flat depository (DP) charge per delivery SELL, before GST. Broker-dependent:
+# Rs 20 is Upstox's (FY2026-27); other brokers charge roughly Rs 13-20. Being
+# flat, it weighs more on small positions.
+DP_CHARGE_PER_SELL: float = 20.0
+
 def calculate_transaction_cost(trade_value: float, side: str) -> float:
     """
     Calculate approximate transaction costs for Indian equity delivery trades.
     
-    Rates used (approximate as of recent NSE/SEBI rules):
-    - Brokerage: ₹0 for delivery (common for discount brokers)
+    Rates used (checked 2026-10 against Upstox's own brokerage calculator,
+    GET /v2/charges/brokerage, for NSE equity delivery on one account):
+    - Brokerage: ₹0 for delivery (that account's plan; many brokers, Upstox's
+      standard tariff included, charge a per-order fee, which this omits)
     - STT: 0.1% on both buy and sell
-    - Exchange Transaction Charges: ~0.00345%
+    - Exchange Transaction Charges: 0.00307% (NSE 0.00297% + IPFT 0.0001%;
+      today's rate, applied to every year of a backtest)
     - SEBI Charges: ₹10 per crore (0.0001%)
     - Stamp Duty: 0.015% on buy side only
-    - GST: 18% on (Brokerage + Exchange Charges)
+    - DP (depository) charge: flat Rs 20 per delivery SELL (broker-dependent;
+      Rs 20 is a measured Upstox FY2026-27 figure)
+    - GST: 18% on (Brokerage + Exchange Charges + SEBI Charges + DP charge),
+      which reproduces a real Upstox contract-note GST total
     
     NOTE: These rates change periodically and should be verified against 
     current broker and SEBI schedules.
@@ -31,7 +48,7 @@ def calculate_transaction_cost(trade_value: float, side: str) -> float:
     
     brokerage = 0.0
     stt_rate = 0.001
-    exchange_rate = 0.0000345
+    exchange_rate = 0.0000307
     sebi_rate = 0.000001
     stamp_duty_rate = 0.00015
     gst_rate = 0.18
@@ -39,12 +56,13 @@ def calculate_transaction_cost(trade_value: float, side: str) -> float:
     stt = trade_value * stt_rate
     exchange_charges = trade_value * exchange_rate
     sebi_charges = trade_value * sebi_rate
+    dp_charge = DP_CHARGE_PER_SELL if side == 'SELL' else 0.0
     
-    gst = (brokerage + exchange_charges) * gst_rate
+    gst = (brokerage + exchange_charges + sebi_charges + dp_charge) * gst_rate
     
     stamp_duty = (trade_value * stamp_duty_rate) if side == 'BUY' else 0.0
     
-    total_cost = brokerage + stt + exchange_charges + sebi_charges + gst + stamp_duty
+    total_cost = brokerage + stt + exchange_charges + sebi_charges + dp_charge + gst + stamp_duty
     return total_cost
 
 def calculate_metrics(
@@ -125,6 +143,9 @@ def ensure_backtest_schema(conn: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    # Databases created before ENGINE_VERSION existed gain the column; their
+    # old rows keep NULL rather than being mislabelled with the current version.
+    conn.execute("ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS engine_version INTEGER")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS backtest_trades (
@@ -271,7 +292,8 @@ def _schedule_executions(
     (they cannot be executed inside the backtest range).
 
     Returns:
-        Executions sorted by ``exec_date`` then ``symbol``, each a dict with
+        Executions sorted by ``exec_date``, then SELLs before BUYs, then
+        ``symbol``, each a dict with
         ``symbol``, ``signal_date``, ``signal_type``, ``exec_date``.
     """
     scheduled: list[dict[str, object]] = []
@@ -294,8 +316,26 @@ def _schedule_executions(
             }
         )
 
-    scheduled.sort(key=lambda item: (item["exec_date"], item["symbol"]))
+    # SELLs before BUYs on the same morning: an exit frees its slot and cash
+    # for that day's entries, whatever the tickers are called.
+    scheduled.sort(key=lambda item: (item["exec_date"], item["signal_type"] != "SELL", item["symbol"]))
     return scheduled
+
+
+def _affordable_quantity(budget: float, fill_price: float) -> int:
+    """Largest whole-share quantity whose value plus buy-side costs fits ``budget``.
+
+    Starts from the proportional estimate at the budget's own size, then steps
+    down until the real cost of the actual order fits, so a flat (non
+    proportional) fee can never make the debit exceed the budget.
+    """
+    if budget <= 0 or fill_price <= 0:
+        return 0
+    cost_rate = calculate_transaction_cost(budget, "BUY") / budget
+    quantity = int(budget // (fill_price * (1 + cost_rate)))
+    while quantity > 0 and quantity * fill_price + calculate_transaction_cost(quantity * fill_price, "BUY") > budget:
+        quantity -= 1
+    return quantity
 
 
 def _close_position(
@@ -352,7 +392,7 @@ def _simulate(
         initial_capital: Starting cash.
         slippage_pct: Slippage in percentage points applied against fills.
         max_concurrent_positions: Cap on simultaneously open positions; also
-            the equal-weight sizing divisor.
+            the equal-weight sizing divisor (of equity, not of remaining cash).
 
     Returns:
         Tuple of ``(trades, equity_rows, skipped_signal_count)``.
@@ -365,6 +405,9 @@ def _simulate(
         executions_by_date.setdefault(item["exec_date"], []).append(item)
 
     cash = float(initial_capital)
+    # Equity at the previous close: the sizing basis for today's fills, known
+    # before the open (never today's close, which isn't known yet).
+    prior_equity = float(initial_capital)
     open_positions: dict[str, dict[str, object]] = {}
     trades: list[dict[str, object]] = []
     equity_rows: list[dict[str, object]] = []
@@ -383,8 +426,8 @@ def _simulate(
                     continue
 
                 fill_price = open_price * (1 + slippage_frac)
-                allocation = cash / max_concurrent_positions
-                quantity = int(allocation // fill_price)
+                budget = min(prior_equity / max_concurrent_positions, cash)
+                quantity = _affordable_quantity(budget, fill_price)
                 if quantity < 1:
                     skipped += 1
                     continue
@@ -437,6 +480,10 @@ def _simulate(
                 "equity": cash + positions_value,
             }
         )
+        # A held symbol with no known close yet makes today's mark NaN; keep
+        # sizing from the last finite equity rather than feeding NaN onward.
+        if np.isfinite(cash + positions_value):
+            prior_equity = cash + positions_value
 
     return trades, equity_rows, skipped
 
@@ -479,10 +526,10 @@ def store_backtest_results(
     conn.execute(
         """
         INSERT INTO backtest_runs (
-            run_id, strategy_name, start_date, end_date, initial_capital, position_sizing
-        ) VALUES (?, ?, ?, ?, ?, ?)
+            run_id, strategy_name, start_date, end_date, initial_capital, position_sizing, engine_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        [run_id, strategy_name, start_date, end_date, initial_capital, position_sizing],
+        [run_id, strategy_name, start_date, end_date, initial_capital, position_sizing, ENGINE_VERSION],
     )
 
     conn.execute(
@@ -550,9 +597,13 @@ def run_backtest(
     ``slippage_pct`` is in percentage points (``0.05`` means 0.05%) and
     always worsens the fill — buys pay above open, sells give up below open.
 
-    Only ``position_sizing='equal_weight'`` is supported: each BUY allocates
-    ``current_cash / max_concurrent_positions`` and buys as many whole shares
-    as that affords. A BUY signal is skipped (not queued, not retried) if the
+    Only ``position_sizing='equal_weight'`` is supported: each BUY targets
+    ``equity / max_concurrent_positions``, with equity marked at the previous
+    close (``initial_capital`` on the first day), capped by available cash,
+    and buys as many whole shares as that budget affords including buy-side
+    costs. When cash is short of the target, the entry is sized to the cash
+    left, so it can be much smaller than its peers (down to one share) and
+    still occupies a slot. A BUY signal is skipped (not queued, not retried) if the
     symbol already has an open position, ``max_concurrent_positions`` is
     already reached, or the allocation can't cover even one share. A SELL
     signal for a symbol with no open position is ignored.
