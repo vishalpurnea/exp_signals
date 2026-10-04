@@ -1,0 +1,208 @@
+"""Tests for src/earnings.py: the earnings-event data source behind the
+post-earnings-announcement-drift (PEAD) signal.
+
+Would catch: the upsert losing/duplicating a row on a rerun, a future
+(not-yet-reported) earnings row leaking into stored history, the
+day-counting in attach_earnings_features drifting across a symbol
+boundary or failing to reset at a new earnings event, or the whole batch
+aborting because one symbol's fetch failed.
+"""
+
+from __future__ import annotations
+
+import pandas as pd
+import pytest
+
+import src.earnings as earnings_module
+from src.earnings import (
+    attach_earnings_features,
+    ensure_earnings_schema,
+    fetch_and_store_earnings,
+    load_earnings_history,
+)
+from tests.helpers import make_conn
+
+
+def _panel(symbol: str, dates: pd.DatetimeIndex) -> pd.DataFrame:
+    return pd.DataFrame({"symbol": symbol, "date": dates, "adj_close": range(len(dates))})
+
+
+# --- ensure_earnings_schema / load_earnings_history --------------------------
+
+
+def test_ensure_earnings_schema_is_idempotent():
+    conn = make_conn()
+    ensure_earnings_schema(conn)
+    ensure_earnings_schema(conn)  # must not raise on a second call
+    assert load_earnings_history(conn, ["AAA"]).empty
+
+
+def test_load_earnings_history_empty_when_nothing_fetched():
+    conn = make_conn()
+    result = load_earnings_history(conn, ["AAA"])
+    assert result.empty
+    assert list(result.columns) == ["symbol", "earnings_date", "eps_estimate", "eps_actual", "surprise_pct"]
+
+
+# --- fetch_and_store_earnings --------------------------------------------------
+
+
+def test_fetch_and_store_earnings_round_trips_through_load(monkeypatch):
+    conn = make_conn()
+    fake_rows = pd.DataFrame(
+        {
+            "symbol": ["AAA", "AAA"],
+            "earnings_date": pd.to_datetime(["2024-01-03", "2024-04-03"]),
+            "eps_estimate": [10.0, 11.0],
+            "eps_actual": [10.5, 10.8],
+            "surprise_pct": [5.0, -1.8],
+        }
+    )
+    monkeypatch.setattr(earnings_module, "_fetch_one_symbol", lambda symbol: fake_rows)
+
+    result = fetch_and_store_earnings(conn, ["AAA"], delay_seconds=0)
+    assert result == {"successful": ["AAA"], "failed": []}
+
+    stored = load_earnings_history(conn, ["AAA"])
+    assert len(stored) == 2
+    assert stored["surprise_pct"].tolist() == [5.0, -1.8]
+
+
+def test_fetch_and_store_earnings_upsert_overwrites_on_rerun():
+    """A later fetch for the SAME (symbol, earnings_date) must update the
+    stored surprise, not duplicate the row -- e.g. an estimate revision
+    being reflected on a later fetch."""
+    conn = make_conn()
+    ensure_earnings_schema(conn)
+
+    def _store(surprise: float) -> None:
+        rows = pd.DataFrame(
+            {
+                "symbol": ["AAA"],
+                "earnings_date": pd.to_datetime(["2024-01-03"]),
+                "eps_estimate": [10.0],
+                "eps_actual": [10.5],
+                "surprise_pct": [surprise],
+            }
+        )
+        conn.register("_t", rows)
+        conn.execute(
+            """
+            INSERT INTO earnings_data (symbol, earnings_date, eps_estimate, eps_actual, surprise_pct)
+            SELECT symbol, earnings_date, eps_estimate, eps_actual, surprise_pct FROM _t
+            ON CONFLICT (symbol, earnings_date) DO UPDATE SET surprise_pct = excluded.surprise_pct
+            """
+        )
+        conn.unregister("_t")
+
+    _store(5.0)
+    _store(7.5)  # revised
+    stored = load_earnings_history(conn, ["AAA"])
+    assert len(stored) == 1
+    assert stored["surprise_pct"].iloc[0] == pytest.approx(7.5)
+
+
+def test_fetch_and_store_earnings_partitions_successes_and_failures(monkeypatch):
+    """One symbol's fetch raising must not abort the batch -- would catch
+    a bug that lets one bad symbol take down the whole fetch, same
+    resilience contract as src.universe.bulk_fetch_and_store."""
+    conn = make_conn()
+
+    def fake_fetch(symbol: str) -> pd.DataFrame:
+        if symbol == "BBB":
+            raise RuntimeError("symbol may be delisted")
+        return pd.DataFrame(
+            {
+                "symbol": [symbol],
+                "earnings_date": pd.to_datetime(["2024-01-03"]),
+                "eps_estimate": [10.0],
+                "eps_actual": [10.5],
+                "surprise_pct": [5.0],
+            }
+        )
+
+    monkeypatch.setattr(earnings_module, "_fetch_one_symbol", fake_fetch)
+    result = fetch_and_store_earnings(conn, ["AAA", "BBB", "CCC"], delay_seconds=0)
+    assert result == {"successful": ["AAA", "CCC"], "failed": ["BBB"]}
+
+
+def test_fetch_and_store_earnings_never_sleeps_after_the_last_symbol(monkeypatch):
+    conn = make_conn()
+    monkeypatch.setattr(earnings_module, "_fetch_one_symbol", lambda symbol: pd.DataFrame())
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(earnings_module.time, "sleep", lambda s: sleep_calls.append(s))
+
+    fetch_and_store_earnings(conn, ["AAA", "BBB", "CCC"], delay_seconds=5)
+    assert sleep_calls == [5, 5]  # three symbols -> exactly two sleeps, never a trailing one
+
+
+def test_fetch_one_symbol_drops_unreported_future_rows(monkeypatch):
+    """A scheduled-but-not-yet-reported earnings row (NaN actual/surprise,
+    the shape yfinance itself returns for an upcoming report) must be
+    dropped -- only rows with a real reported EPS belong in stored history."""
+
+    class _FakeTicker:
+        def get_earnings_dates(self, limit):
+            index = pd.to_datetime(["2024-10-16", "2024-07-17"]).tz_localize("America/New_York")
+            return pd.DataFrame(
+                {"EPS Estimate": [16.27, 7.10], "Reported EPS": [float("nan"), 9.81], "Surprise(%)": [float("nan"), 38.17]},
+                index=index.set_names("Earnings Date"),
+            )
+
+    monkeypatch.setattr(earnings_module.yf, "Ticker", lambda yf_ticker: _FakeTicker())
+    result = earnings_module._fetch_one_symbol("RELIANCE")
+    assert len(result) == 1
+    assert result.iloc[0]["symbol"] == "RELIANCE"
+    assert result.iloc[0]["earnings_date"] == pd.Timestamp("2024-07-17")
+    assert result.iloc[0]["surprise_pct"] == pytest.approx(38.17)
+
+
+# --- attach_earnings_features --------------------------------------------------
+
+
+def test_attach_earnings_features_joins_and_counts_days_since_event():
+    """Hand-traced: an event on day 2 (surprise=10.0) holds until a second
+    event on day 6 (surprise=-5.0) supersedes it. Independently verified
+    via direct computation before being hardcoded here."""
+    dates = pd.date_range("2024-01-01", periods=10)
+    df = _panel("AAA", dates)
+    earnings = pd.DataFrame(
+        {"symbol": ["AAA", "AAA"], "earnings_date": pd.to_datetime(["2024-01-03", "2024-01-07"]), "surprise_pct": [10.0, -5.0]}
+    )
+
+    result = attach_earnings_features(df, earnings)
+    surprise = result.set_index("date")["last_earnings_surprise_pct"]
+    days_since = result.set_index("date")["trading_days_since_earnings"]
+
+    assert surprise.loc["2024-01-01":"2024-01-02"].isna().all()
+    assert surprise.loc["2024-01-03":"2024-01-06"].eq(10.0).all()
+    assert surprise.loc["2024-01-07":"2024-01-10"].eq(-5.0).all()
+    assert days_since.loc["2024-01-03"] == 0
+    assert days_since.loc["2024-01-06"] == 3
+    assert days_since.loc["2024-01-07"] == 0  # resets at the new event
+    assert days_since.loc["2024-01-10"] == 3
+
+
+def test_attach_earnings_features_symbols_never_cross_contaminate():
+    """A symbol with no earnings data at all must get all-NaN features,
+    completely unaffected by another symbol's real events in the same
+    input panel."""
+    dates = pd.date_range("2024-01-01", periods=5)
+    df = pd.concat([_panel("AAA", dates), _panel("BBB", dates)], ignore_index=True)
+    earnings = pd.DataFrame({"symbol": ["AAA"], "earnings_date": pd.to_datetime(["2024-01-02"]), "surprise_pct": [7.5]})
+
+    result = attach_earnings_features(df, earnings)
+    bbb = result[result["symbol"] == "BBB"]
+    assert bbb["last_earnings_surprise_pct"].isna().all()
+    assert bbb["trading_days_since_earnings"].isna().all()
+
+    aaa = result[result["symbol"] == "AAA"].set_index("date")
+    assert aaa.loc["2024-01-02", "last_earnings_surprise_pct"] == pytest.approx(7.5)
+
+
+def test_attach_earnings_features_empty_earnings_df_fails_open_to_nan():
+    dates = pd.date_range("2024-01-01", periods=3)
+    df = _panel("AAA", dates)
+    result = attach_earnings_features(df, pd.DataFrame(columns=["symbol", "earnings_date", "surprise_pct"]))
+    assert result["last_earnings_surprise_pct"].isna().all()
+    assert result["trading_days_since_earnings"].isna().all()

@@ -274,6 +274,64 @@ def amihud_illiquidity(df: pd.DataFrame, params: dict) -> pd.Series:
     return signal.reindex(df.index)
 
 
+@register_signal(
+    "post_earnings_drift",
+    default_params={"min_days_since_earnings": 0, "max_days_since_earnings": 60},
+)
+def post_earnings_drift(df: pd.DataFrame, params: dict) -> pd.Series:
+    """Post-earnings-announcement drift (PEAD): a stock's most recent
+    earnings surprise percentage, active only within a bounded window of
+    trading days after that announcement.
+
+    Hypothesis: a well-documented market underreaction -- investors are
+    slow to fully price in an earnings surprise, so a stock that beat
+    (missed) estimates keeps *drifting* in the surprise's own direction
+    for weeks afterward, rather than jumping once to a new fair value and
+    stopping. Structurally different from every other signal in this
+    registry: this is the first one anchored to a discrete, sparse EVENT
+    (one earnings report, roughly every 60 trading days) rather than a
+    continuously-computable rolling function of price/volume alone -- see
+    ``src.earnings``'s module docstring for where the data comes from and
+    its real, checked coverage limits (reliable only for well-covered
+    large/mega-caps; this project's own PEAD work is scoped accordingly).
+
+    Requires ``last_earnings_surprise_pct``/``trading_days_since_earnings``
+    already attached to ``df`` (``research/screen.py``'s own loader does
+    this automatically via ``src.earnings.attach_earnings_features`` --
+    this signal does NOT compute that join itself, matching
+    ``src.dispersion_regime``'s precedent of splitting "compute the raw
+    feature" from "a signal's own hypothesis-specific windowing/threshold").
+
+    ``min_days_since_earnings``/``max_days_since_earnings`` bound which
+    rows the signal is active on (inclusive both ends): a row more than
+    ``max_days_since_earnings`` past its symbol's last known announcement
+    is NaN (too stale to represent "post-earnings" drift -- more likely
+    sitting quietly mid-quarter, waiting for the NEXT report), and a row
+    with no earnings history at all for that symbol is always NaN
+    (``trading_days_since_earnings`` itself is NaN -- see
+    ``attach_earnings_features``). ``min_days_since_earnings`` defaults to
+    0 (the announcement day itself included) rather than excluding it, so
+    a screen's own 1d-vs-60d horizon comparison is what reveals whether
+    an apparent effect is genuine multi-week drift or just the instant
+    reaction re-measured -- not a modeling choice baked into the signal.
+    """
+    min_days = params.get("min_days_since_earnings", 0)
+    max_days = params.get("max_days_since_earnings", 60)
+    required = {"last_earnings_surprise_pct", "trading_days_since_earnings"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"post_earnings_drift requires columns: {sorted(missing)} -- attach via "
+            "src.earnings.attach_earnings_features (research/screen.py's own loader does this "
+            "automatically; raw OHLCV alone is not enough for this signal)."
+        )
+
+    days_since = df["trading_days_since_earnings"]
+    within_window = days_since.between(min_days, max_days)
+    signal = df["last_earnings_surprise_pct"].where(within_window)
+    return signal.reindex(df.index)
+
+
 @register_signal("cross_sectional_rank_momentum", default_params={"window": 20})
 def cross_sectional_rank_momentum(df: pd.DataFrame, params: dict) -> pd.Series:
     """Momentum expressed as each stock's percentile rank across the universe that day.

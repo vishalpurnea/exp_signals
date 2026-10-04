@@ -19,6 +19,7 @@ from research.signal_library import (
     cross_sectional_rank_momentum,
     get_signal,
     momentum,
+    post_earnings_drift,
     register_signal,
     rsi_level,
     volatility,
@@ -66,6 +67,7 @@ def test_available_signals_includes_all_builtins():
         "volatility",
         "cross_sectional_rank_momentum",
         "amihud_illiquidity",
+        "post_earnings_drift",
     ):
         assert expected in names
 
@@ -410,3 +412,71 @@ def test_amihud_illiquidity_higher_price_impact_gives_higher_reading():
     thin_val = amihud_illiquidity(thin, {"window": 1}).iloc[1]
     heavy_val = amihud_illiquidity(heavy, {"window": 1}).iloc[1]
     assert thin_val > heavy_val
+
+
+# ---------------------------------------------------------------------------
+# post_earnings_drift
+# ---------------------------------------------------------------------------
+
+
+def _pead_panel(days_since: list[float], surprise: list[float], symbol: str = "AAA") -> pd.DataFrame:
+    """Build a single-symbol panel with the two pre-attached earnings
+    feature columns post_earnings_drift reads directly -- this signal does
+    NOT compute the join itself (src.earnings.attach_earnings_features
+    does, called by research/screen.py's own loader), so its tests feed
+    those columns in pre-made, matching the signal's actual contract."""
+    dates = pd.date_range("2024-01-01", periods=len(days_since), freq="D")
+    return pd.DataFrame(
+        {
+            "symbol": symbol,
+            "date": dates,
+            "trading_days_since_earnings": days_since,
+            "last_earnings_surprise_pct": surprise,
+        }
+    )
+
+
+def test_post_earnings_drift_missing_columns_raises():
+    df = pd.DataFrame({"symbol": ["A"], "date": [pd.Timestamp("2024-01-01")], "adj_close": [100.0]})
+    with pytest.raises(ValueError, match="trading_days_since_earnings|last_earnings_surprise_pct"):
+        post_earnings_drift(df, {})
+
+
+def test_post_earnings_drift_nan_before_any_earnings_event():
+    """A symbol with no earnings history yet (trading_days_since_earnings
+    itself NaN, the contract attach_earnings_features guarantees) must
+    read as NaN here too, not accidentally pass the window check."""
+    df = _pead_panel(days_since=[float("nan"), float("nan")], surprise=[float("nan"), float("nan")])
+    result = post_earnings_drift(df, {})
+    assert result.isna().all()
+
+
+def test_post_earnings_drift_active_within_default_window():
+    """Default window is [0, 60] inclusive -- day 0 and day 60 both carry
+    the surprise value through; day 61 (one past the window) must be NaN.
+    """
+    df = _pead_panel(days_since=[0, 30, 60, 61], surprise=[12.5, 12.5, 12.5, 12.5])
+    result = post_earnings_drift(df, {})
+    assert result.iloc[0] == pytest.approx(12.5)
+    assert result.iloc[1] == pytest.approx(12.5)
+    assert result.iloc[2] == pytest.approx(12.5)
+    assert pd.isna(result.iloc[3])
+
+
+def test_post_earnings_drift_custom_window_excludes_the_announcement_day():
+    """min_days_since_earnings=1 is how a caller isolates pure drift from
+    the instant reaction -- day 0 must be NaN, day 1 must carry the value."""
+    df = _pead_panel(days_since=[0, 1, 2], surprise=[8.0, 8.0, 8.0])
+    result = post_earnings_drift(df, {"min_days_since_earnings": 1, "max_days_since_earnings": 2})
+    assert pd.isna(result.iloc[0])
+    assert result.iloc[1] == pytest.approx(8.0)
+    assert result.iloc[2] == pytest.approx(8.0)
+
+
+def test_post_earnings_drift_value_tracks_the_most_recent_surprise_not_absolute():
+    """A negative surprise must come through as a negative signal value
+    (not, say, an absolute magnitude) -- direction is the whole point of
+    testing whether price keeps drifting in the surprise's own direction."""
+    df = _pead_panel(days_since=[0], surprise=[-15.0])
+    result = post_earnings_drift(df, {})
+    assert result.iloc[0] == pytest.approx(-15.0)

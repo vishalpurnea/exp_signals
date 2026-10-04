@@ -16,6 +16,7 @@ from strategies import (  # noqa: F401
     dispersion_gated_reversion,
     dispersion_gated_trend_ladder,
     illiquidity_tilt,
+    post_earnings_drift,
     precision_pullback,
     regime_switching_allocator,
     rsi_mean_reversion,

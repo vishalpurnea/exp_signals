@@ -41,6 +41,7 @@ import pandas as pd
 
 import backtest as bt
 from strategies.registry import get_strategy
+from src.earnings import attach_earnings_features, load_earnings_history
 from src.market_regime import attach_market_regime, load_market_regime
 from src.universe import DEFAULT_DB_PATH, get_active_universe
 
@@ -129,7 +130,13 @@ def _load_ohlcv_history(
     draw from. Also attaches the Nifty 50 market-regime columns (see
     ``src.market_regime``), same as ``src.strategy.load_strategy_input``, so
     a strategy that uses them behaves identically whether it's driven
-    through the production pipeline or through this research tool.
+    through the production pipeline or through this research tool. Also
+    attaches each symbol's own earnings-event features (see
+    ``src.earnings.attach_earnings_features``) the same way
+    ``research/screen.py``'s own loader does — unconditionally, inert
+    (all-NaN) for a symbol with no fetched earnings history, so this is
+    additive, not a breaking change, for every strategy that doesn't
+    declare those two columns in ``required_columns``.
     """
     if not symbols:
         return pd.DataFrame(columns=list(_OHLCV_COLUMNS))
@@ -146,7 +153,8 @@ def _load_ohlcv_history(
     params: list[object] = [*symbols, end_date]
     history = conn.execute(query, params).df()
     history["date"] = pd.to_datetime(history["date"]).dt.normalize()
-    return attach_market_regime(history, load_market_regime(conn))
+    history = attach_market_regime(history, load_market_regime(conn))
+    return attach_earnings_features(history, load_earnings_history(conn, symbols))
 
 
 def _filter_to_range(signals_df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
