@@ -237,3 +237,59 @@ def attach_earnings_features(df: pd.DataFrame, earnings_df: pd.DataFrame) -> pd.
         merged_frames.append(merged.drop(columns=["_event_date"]))
 
     return pd.concat(merged_frames, ignore_index=True)
+
+
+def attach_trailing_eps(df: pd.DataFrame, earnings_df: pd.DataFrame) -> pd.DataFrame:
+    """Broadcast each symbol's point-in-time trailing-twelve-month (TTM) EPS
+    onto every one of its own trading-day rows -- the data a fundamental
+    "value" signal (earnings yield, P/E) needs that ``attach_earnings_features``
+    doesn't provide (that one carries the latest report's surprise %, not a
+    summable EPS figure).
+
+    Adds one column, ``trailing_ttm_eps``: the sum of the four most recent
+    REPORTED quarterly EPS values as of this row's date (point-in-time --
+    a quarter's EPS only counts from its own ``earnings_date`` onward, same
+    backward-``merge_asof`` convention as ``attach_earnings_features``, so
+    this can never leak a not-yet-reported quarter into an earlier row).
+    NaN until a symbol has at least 4 reported quarters on record (a
+    1-, 2-, or 3-quarter partial sum would silently understate a real
+    TTM figure rather than fail safely), and NaN for a symbol with no
+    earnings data at all.
+
+    Deliberately a SUM of the last 4 quarters' ``eps_actual``, not an
+    average or an annualized single quarter -- matches the standard
+    "trailing twelve month EPS" definition the P/E ratios quoted in
+    financial media use, so a screen against this lines up with the
+    plain-language claim "cheap by trailing earnings," not an approximation
+    of it.
+    """
+    working = df.copy()
+    working["date"] = pd.to_datetime(working["date"], errors="coerce").dt.normalize()
+
+    if earnings_df.empty:
+        working["trailing_ttm_eps"] = float("nan")
+        return working
+
+    working = working.sort_values(["symbol", "date"]).reset_index(drop=True)
+    merged_frames: list[pd.DataFrame] = []
+    for symbol, group in working.groupby("symbol", sort=False):
+        events = earnings_df.loc[earnings_df["symbol"] == symbol, ["earnings_date", "eps_actual"]].sort_values(
+            "earnings_date"
+        ).copy()
+        if events.empty:
+            group = group.copy()
+            group["trailing_ttm_eps"] = float("nan")
+            merged_frames.append(group)
+            continue
+
+        events["trailing_ttm_eps"] = events["eps_actual"].rolling(window=4, min_periods=4).sum()
+        merged = pd.merge_asof(
+            group.sort_values("date"),
+            events.rename(columns={"earnings_date": "_event_date"}).loc[:, ["_event_date", "trailing_ttm_eps"]],
+            left_on="date",
+            right_on="_event_date",
+            direction="backward",
+        )
+        merged_frames.append(merged.drop(columns=["_event_date"]))
+
+    return pd.concat(merged_frames, ignore_index=True)

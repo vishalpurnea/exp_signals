@@ -13,6 +13,56 @@ script's output) as of 2026-10-03 — see each strategy's own module docstring
 and `strategies/README.md` for the full methodology/caveats behind a number
 before trusting it in isolation.
 
+## ❌ `earnings_yield` — rejected at the screening stage, never built into a strategy (2026-10-04)
+
+Tried next, on direct request to look at a fundamental (P/E-style) signal.
+New data path: ``src.earnings.attach_trailing_eps`` sums the last 4
+reported quarterly EPS (point-in-time, same backward-``merge_asof``
+convention as the existing PEAD surprise join) into a trailing-twelve-month
+figure, reusing the ``earnings_data`` table already fetched for
+`post_earnings_drift` (so coverage is the same: well-covered Nifty 50
+large-caps, JIOFIN excluded, no new fetch needed). ``earnings_yield =
+trailing_ttm_eps / adj_close`` — EPS/price rather than raw P/E, so a
+loss-making quarter degrades gracefully (a negative yield) instead of a
+division blowing up near zero EPS.
+
+Screened on the Nifty 50, every standard horizon, full period
+(2014-09-24 → 2026-09-18, ~2,940-2,970 trading days, 94% column coverage):
+
+| Horizon | 1d | 5d | 10d | 20d | 40d | 60d |
+|---|---|---|---|---|---|---|
+| Mean IC | 0.0036 | 0.0005 | -0.0002 | -0.0032 | -0.0037 | -0.0011 |
+| t-stat | 0.93 | 0.12 | -0.04 | -0.71 | -0.81 | -0.22 |
+
+Every single horizon: \|t-stat\| < 1.2, no monotonic pattern across
+quintile buckets (20d quintile mean forward returns: 1.69%, 1.55%, 1.17%,
+1.71%, 1.79% — noise, not a value or growth gradient), decile spread
+≈0.001. Split in-sample (2014-2022) vs. out-of-sample (2022-2026) at 60d
+specifically to check for the "looks fine in-sample, decays OOS" pattern
+every other signal this project screened showed in one direction or
+another: it didn't even reach that bar — in-sample IC -0.0072 (t=-1.20),
+out-of-sample IC +0.0089 (t=1.17), both insignificant and opposite signs.
+**The cleanest, most unambiguous null result of any signal screened in
+this project** — unlike `volatility_premium`'s or `post_earnings_drift`'s
+rejections (a real, measurable in-sample relationship too weak to trade,
+or that decayed out-of-sample), this one never showed a real relationship
+at any stage to begin with. Correctly caught at the screening stage,
+before any strategy-building effort — exactly what `research/screen.py`
+exists to do (see its own module docstring). Not extended to the Nifty
+500: `src.earnings`'s coverage caveat (severe gaps outside well-covered
+large-caps) applies identically here, and a signal with no detectable
+edge on the universe with the BEST data coverage is not worth re-testing
+on the universe with the worst.
+
+Possible reasons this didn't work, not tested further (would need new
+data infrastructure this project doesn't have): no sector-neutralization
+(a raw cross-sector P/E/earnings-yield comparison conflates genuine
+mispricing with structural differences between, say, a bank and an IT
+services company — this project has no sector/industry classification
+data at all), and Nifty 50 mega-caps may simply be too efficiently priced
+on this one measure for a value effect to show up without sector or
+peer-relative context.
+
 ## ⚠ `intraday_reversal` — reconsidered after deeper validation (2026-10-04)
 
 Originally logged here as "the first production candidate" (2026-10-04,

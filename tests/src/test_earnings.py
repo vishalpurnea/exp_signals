@@ -16,6 +16,7 @@ import pytest
 import src.earnings as earnings_module
 from src.earnings import (
     attach_earnings_features,
+    attach_trailing_eps,
     ensure_earnings_schema,
     fetch_and_store_earnings,
     load_earnings_history,
@@ -206,3 +207,72 @@ def test_attach_earnings_features_empty_earnings_df_fails_open_to_nan():
     result = attach_earnings_features(df, pd.DataFrame(columns=["symbol", "earnings_date", "surprise_pct"]))
     assert result["last_earnings_surprise_pct"].isna().all()
     assert result["trading_days_since_earnings"].isna().all()
+
+
+# --- attach_trailing_eps --------------------------------------------------
+
+
+def test_attach_trailing_eps_requires_four_reports_before_producing_a_value():
+    """With only 3 reported quarters on record, every row must be NaN --
+    a 3-quarter partial sum would silently understate a real TTM figure.
+    The 4th report (on day 10) makes the rolling 4-quarter sum (1+2+3+4=10)
+    available from that day forward."""
+    dates = pd.date_range("2024-01-01", periods=15)
+    df = _panel("AAA", dates)
+    earnings = pd.DataFrame(
+        {
+            "symbol": ["AAA"] * 4,
+            "earnings_date": pd.to_datetime(["2024-01-01", "2024-01-04", "2024-01-07", "2024-01-10"]),
+            "eps_actual": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+
+    result = attach_trailing_eps(df, earnings).set_index("date")["trailing_ttm_eps"]
+    assert result.loc["2024-01-01":"2024-01-09"].isna().all()
+    assert result.loc["2024-01-10":"2024-01-15"].eq(10.0).all()
+
+
+def test_attach_trailing_eps_rolls_forward_as_a_new_quarter_reports():
+    """A 5th report (eps_actual=5.0) must drop the OLDEST of the prior 4
+    (1.0) out of the trailing sum: 2+3+4+5=14, not 1+2+3+4+5=15."""
+    dates = pd.date_range("2024-01-01", periods=20)
+    df = _panel("AAA", dates)
+    earnings = pd.DataFrame(
+        {
+            "symbol": ["AAA"] * 5,
+            "earnings_date": pd.to_datetime(
+                ["2024-01-01", "2024-01-04", "2024-01-07", "2024-01-10", "2024-01-15"]
+            ),
+            "eps_actual": [1.0, 2.0, 3.0, 4.0, 5.0],
+        }
+    )
+
+    result = attach_trailing_eps(df, earnings).set_index("date")["trailing_ttm_eps"]
+    assert result.loc["2024-01-10":"2024-01-14"].eq(10.0).all()
+    assert result.loc["2024-01-15":"2024-01-20"].eq(14.0).all()
+
+
+def test_attach_trailing_eps_symbols_never_cross_contaminate():
+    dates = pd.date_range("2024-01-01", periods=5)
+    df = pd.concat([_panel("AAA", dates), _panel("BBB", dates)], ignore_index=True)
+    earnings = pd.DataFrame(
+        {
+            "symbol": ["AAA"] * 4,
+            "earnings_date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]),
+            "eps_actual": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+
+    result = attach_trailing_eps(df, earnings)
+    bbb = result[result["symbol"] == "BBB"]
+    assert bbb["trailing_ttm_eps"].isna().all()
+
+    aaa = result[result["symbol"] == "AAA"].set_index("date")
+    assert aaa.loc["2024-01-04", "trailing_ttm_eps"] == pytest.approx(10.0)
+
+
+def test_attach_trailing_eps_empty_earnings_df_fails_open_to_nan():
+    dates = pd.date_range("2024-01-01", periods=3)
+    df = _panel("AAA", dates)
+    result = attach_trailing_eps(df, pd.DataFrame(columns=["symbol", "earnings_date", "eps_actual"]))
+    assert result["trailing_ttm_eps"].isna().all()

@@ -332,6 +332,50 @@ def post_earnings_drift(df: pd.DataFrame, params: dict) -> pd.Series:
     return signal.reindex(df.index)
 
 
+@register_signal("earnings_yield", default_params={})
+def earnings_yield(df: pd.DataFrame, params: dict) -> pd.Series:
+    """Trailing-twelve-month EPS divided by price (the inverse of the
+    standard trailing P/E ratio, used in preference to P/E itself).
+
+    Hypothesis: the classic "value" factor -- a stock cheap relative to
+    its own recent earnings tends to outperform one that's expensive
+    relative to its earnings, as the market's growth expectations (priced
+    into the expensive one) mean-revert. The first FUNDAMENTAL (not
+    price/volume-derived, and not a sparse event-window signal like
+    ``post_earnings_drift``) signal in this registry -- ``trailing_ttm_eps``
+    updates only ~4 times a year (one per earnings report) while
+    ``adj_close`` updates daily, so this signal's day-to-day movement is
+    almost entirely driven by price, with step changes on earnings days.
+
+    Earnings YIELD (EPS/price), not P/E (price/EPS), deliberately: EPS can
+    be negative (a loss-making quarter) or near zero, and a ratio with EPS
+    in the denominator blows up or flips sign unpredictably near that
+    point. Earnings yield stays well-behaved through zero (a lossmaking
+    stock simply gets a negative yield, correctly read as "unattractive on
+    this measure," not a division-by-near-zero artifact) -- the standard
+    reason quant equity research uses earnings yield over raw P/E.
+
+    Requires ``trailing_ttm_eps`` already attached to ``df`` (``research/screen.py``'s
+    own loader does this via ``src.earnings.attach_trailing_eps`` --
+    this signal does NOT compute that join itself, same split as
+    ``post_earnings_drift``). NaN wherever ``trailing_ttm_eps`` is NaN
+    (fewer than 4 reported quarters on record, or no earnings data for
+    that symbol at all -- see ``attach_trailing_eps``).
+    """
+    required = {"trailing_ttm_eps", "adj_close"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"earnings_yield requires columns: {sorted(missing)} -- attach via "
+            "src.earnings.attach_trailing_eps (research/screen.py's own loader does this "
+            "automatically; raw OHLCV alone is not enough for this signal)."
+        )
+
+    price = df["adj_close"].replace(0, float("nan"))
+    signal = df["trailing_ttm_eps"] / price
+    return signal.reindex(df.index)
+
+
 def _adjusted_open(working: pd.DataFrame) -> pd.Series:
     """Raw ``open`` scaled by that SAME day's own ``adj_close / close`` ratio.
 

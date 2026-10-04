@@ -17,6 +17,7 @@ from research.signal_library import (
     available_signals,
     bb_position,
     cross_sectional_rank_momentum,
+    earnings_yield,
     get_signal,
     intraday_return,
     momentum,
@@ -72,6 +73,7 @@ def test_available_signals_includes_all_builtins():
         "post_earnings_drift",
         "overnight_return",
         "intraday_return",
+        "earnings_yield",
     ):
         assert expected in names
 
@@ -484,6 +486,61 @@ def test_post_earnings_drift_value_tracks_the_most_recent_surprise_not_absolute(
     df = _pead_panel(days_since=[0], surprise=[-15.0])
     result = post_earnings_drift(df, {})
     assert result.iloc[0] == pytest.approx(-15.0)
+
+
+# ---------------------------------------------------------------------------
+# earnings_yield
+# ---------------------------------------------------------------------------
+
+
+def _ey_panel(trailing_ttm_eps: list[float], adj_close: list[float], symbol: str = "AAA") -> pd.DataFrame:
+    """Build a single-symbol panel with the pre-attached trailing_ttm_eps
+    column earnings_yield reads directly -- this signal does NOT compute
+    the join itself (src.earnings.attach_trailing_eps does, called by
+    research/screen.py's own loader), so its tests feed that column in
+    pre-made, matching the signal's actual contract."""
+    dates = pd.date_range("2024-01-01", periods=len(trailing_ttm_eps), freq="D")
+    return pd.DataFrame(
+        {"symbol": symbol, "date": dates, "trailing_ttm_eps": trailing_ttm_eps, "adj_close": adj_close}
+    )
+
+
+def test_earnings_yield_missing_columns_raises():
+    df = pd.DataFrame({"symbol": ["A"], "date": [pd.Timestamp("2024-01-01")], "adj_close": [100.0]})
+    with pytest.raises(ValueError, match="trailing_ttm_eps"):
+        earnings_yield(df, {})
+
+
+def test_earnings_yield_hand_computed_value():
+    """TTM EPS 10.0 on a 200.0 price -> 10/200 = 0.05 exactly."""
+    df = _ey_panel(trailing_ttm_eps=[10.0], adj_close=[200.0])
+    result = earnings_yield(df, {})
+    assert result.iloc[0] == pytest.approx(0.05)
+
+
+def test_earnings_yield_negative_eps_gives_negative_yield_not_a_crash():
+    """A loss-making trailing year (negative TTM EPS) must read as a
+    negative yield -- the whole reason this signal is EPS/price rather
+    than price/EPS (a raw P/E would flip sign unpredictably or blow up
+    near zero EPS instead of degrading gracefully through it)."""
+    df = _ey_panel(trailing_ttm_eps=[-5.0], adj_close=[100.0])
+    result = earnings_yield(df, {})
+    assert result.iloc[0] == pytest.approx(-0.05)
+
+
+def test_earnings_yield_nan_before_four_reported_quarters():
+    """A symbol with fewer than 4 reported quarters on record
+    (trailing_ttm_eps itself NaN, the contract attach_trailing_eps
+    guarantees) must read as NaN here too, not a spurious value."""
+    df = _ey_panel(trailing_ttm_eps=[float("nan"), float("nan")], adj_close=[100.0, 105.0])
+    result = earnings_yield(df, {})
+    assert result.isna().all()
+
+
+def test_earnings_yield_zero_price_is_nan_not_a_crash():
+    df = _ey_panel(trailing_ttm_eps=[10.0], adj_close=[0.0])
+    result = earnings_yield(df, {})
+    assert pd.isna(result.iloc[0])
 
 
 # ---------------------------------------------------------------------------
