@@ -36,6 +36,7 @@ internally, at whatever parameters its config specifies.
 from __future__ import annotations
 
 import duckdb
+import numpy as np
 import pandas as pd
 
 import backtest as bt
@@ -316,6 +317,349 @@ def run_out_of_sample_test(
         strategy.generate_signals(history), out_of_sample_start, out_of_sample_end
     )
     return _backtest_signals(signals_df, price_df)
+
+
+# ---------------------------------------------------------------------------
+# Validation gate: three checks a strategy's out-of-sample result needs to
+# survive before it's reported as a real finding, built reactively (one
+# strategy, one surprise, at a time) across this project's history --
+# illiquidity_tilt's capacity problem, trend_ladder's same-day tie-break
+# sensitivity, and every strategy's in-sample/out-of-sample split. Running
+# all three together, every time, means the next strategy's issue (if it
+# has one) surfaces before anyone gets attached to a good-looking number,
+# not three conversations later. See run_validation_gate for the combined
+# report; the three checks below are also usable independently.
+# ---------------------------------------------------------------------------
+
+
+def _equity_curve_metrics(
+    equity: pd.Series, initial_capital: float, risk_free_rate: float = 0.06
+) -> dict[str, object]:
+    """``backtest.calculate_metrics``'s equity-curve formulas (CAGR, max
+    drawdown, risk-free-adjusted Sharpe), applied to a plain equity series
+    with no discrete trades -- what a buy-and-hold benchmark needs, since
+    it was never run through ``backtest.py``'s trade-by-trade simulation.
+    Kept in exact lockstep with ``calculate_metrics`` (same days/365 CAGR,
+    same ``abs(drawdown.min())`` convention, same risk-free subtraction)
+    so a strategy and its benchmark are never compared on different
+    formulas.
+    """
+    final_equity = float(equity.iloc[-1])
+    days = (equity.index[-1] - equity.index[0]).days
+    cagr = ((final_equity / initial_capital) ** (365.0 / days) - 1) * 100 if days > 0 else 0.0
+
+    rolling_max = equity.cummax()
+    drawdown = (equity - rolling_max) / rolling_max
+    max_drawdown_pct = abs(drawdown.min()) * 100
+
+    daily_returns = equity.pct_change().dropna()
+    if not daily_returns.empty and daily_returns.std() != 0:
+        daily_rf = (1 + risk_free_rate) ** (1 / 252) - 1
+        excess_returns = daily_returns - daily_rf
+        sharpe_ratio = (excess_returns.mean() / excess_returns.std()) * (252**0.5)
+    else:
+        sharpe_ratio = 0.0
+
+    return {
+        "total_return_pct": (final_equity / initial_capital - 1) * 100,
+        "cagr": cagr,
+        "max_drawdown_pct": max_drawdown_pct,
+        "sharpe_ratio": sharpe_ratio,
+        "final_equity": final_equity,
+    }
+
+
+def compute_buy_and_hold_benchmark(
+    history: pd.DataFrame, start_date: str, end_date: str, initial_capital: float = INITIAL_CAPITAL
+) -> dict[str, object]:
+    """Equal-weight buy-and-hold benchmark over ``[start_date, end_date]``.
+
+    Only symbols with a valid ``adj_close`` on the window's own first day
+    are included (can't buy-and-hold something not listed yet) -- capital
+    is split evenly across them at that day's price and held, untouched,
+    to the window's last day. Returns the same shape as
+    ``_backtest_signals`` plus ``eligible_symbol_count``, so the two are
+    directly comparable.
+
+    Args:
+        history: Must have ``symbol``, ``date``, ``adj_close`` -- the same
+            panel a strategy's own ``generate_signals`` would receive (see
+            ``_load_ohlcv_history``).
+        start_date, end_date: Inclusive window (``YYYY-MM-DD``).
+        initial_capital: Total capital split evenly across eligible symbols.
+    """
+    hist = history.loc[:, ["symbol", "date", "adj_close"]].dropna()
+    hist = hist[(hist["date"] >= pd.Timestamp(start_date)) & (hist["date"] <= pd.Timestamp(end_date))]
+    if hist.empty:
+        return {"total_return_pct": 0.0, "cagr": 0.0, "max_drawdown_pct": 0.0, "sharpe_ratio": 0.0, "final_equity": initial_capital, "eligible_symbol_count": 0}
+
+    window_start_date = hist["date"].min()
+    first_date_per_symbol = hist.groupby("symbol")["date"].min()
+    eligible = first_date_per_symbol[first_date_per_symbol == window_start_date].index
+
+    pivot = (
+        hist[hist["symbol"].isin(eligible)]
+        .pivot(index="date", columns="symbol", values="adj_close")
+        .sort_index()
+        .ffill()
+    )
+    units = (initial_capital / len(eligible)) / pivot.iloc[0]
+    equity = (pivot * units).sum(axis=1)
+
+    metrics = _equity_curve_metrics(equity, initial_capital)
+    metrics["eligible_symbol_count"] = len(eligible)
+    return metrics
+
+
+def check_order_sensitivity(
+    conn: duckdb.DuckDBPyConnection,
+    strategy_name: str,
+    symbols: list[str],
+    start_date: str,
+    end_date: str,
+    max_concurrent_positions: int,
+    trials: int = 40,
+    seed: int = 7,
+    **strategy_params: object,
+) -> pd.DataFrame:
+    """How much does this result depend on an arbitrary same-day tie-break?
+
+    WHY THIS EXISTS: ``backtest.py`` schedules same-day executions by
+    ``(date, SELL-before-BUY, symbol)`` -- when more signals qualify than
+    there are slots on a given day, which ones actually fill depends on
+    alphabetical symbol order, which has nothing to do with the strategy's
+    own logic. This went undetected for every strategy in this project
+    until a PR's own review flagged it for ``trend_ladder`` on a different
+    window, and checking it directly on this project's own out-of-sample
+    window found it changed that strategy's entire verdict (see
+    ``candidates/trend_ladder.md``). Run this on ANY strategy before
+    trusting a result where ``total_trades`` might be bumping against
+    ``max_concurrent_positions`` on a meaningful number of days.
+
+    Reruns the exact same signals and prices ``trials`` times, each time
+    relabeling every symbol with a random permutation of the same universe
+    (bijective, so nothing about the underlying data changes) before
+    scheduling executions -- the only thing that changes between trials is
+    which symbol's name happens to sort first on a contended day. Trial 0
+    is always the real, unpermuted (alphabetical) run, included so it can
+    be compared against the distribution of the rest.
+
+    Returns:
+        One row per trial (``trial`` 0 = real/alphabetical, 1..``trials``
+        = random relabelings), with ``cagr``, ``sharpe_ratio``,
+        ``max_drawdown_pct``, ``total_trades``. A result that only looks
+        good because ``trial == 0`` sits near the top of this distribution
+        should not be reported as the strategy's performance.
+    """
+    history = _load_ohlcv_history(conn, symbols, end_date)
+    strategy = get_strategy(strategy_name)(**strategy_params)
+    price_df = bt._load_daily_prices(conn, symbols, start_date, end_date)
+    signals_df = _filter_to_range(strategy.generate_signals(history), start_date, end_date)
+
+    def _run(signals: pd.DataFrame, prices: pd.DataFrame) -> dict[str, object]:
+        price_index = bt._build_price_index(prices)
+        close_matrix = prices.pivot(index="date", columns="symbol", values="close").sort_index().ffill()
+        scheduled = bt._schedule_executions(signals, price_index)
+        trades, equity_rows, _ = bt._simulate(
+            scheduled=scheduled,
+            price_index=price_index,
+            close_matrix=close_matrix,
+            initial_capital=INITIAL_CAPITAL,
+            slippage_pct=SLIPPAGE_PCT,
+            max_concurrent_positions=max_concurrent_positions,
+        )
+        trades_df = pd.DataFrame(trades)
+        equity_curve = pd.DataFrame(equity_rows).set_index("date") if equity_rows else pd.DataFrame()
+        return bt.calculate_metrics(trades_df, equity_curve, INITIAL_CAPITAL)
+
+    rows = [{"trial": 0, **_run(signals_df, price_df)}]
+    rng = np.random.default_rng(seed)
+    for trial in range(1, trials + 1):
+        mapping = dict(zip(symbols, rng.permutation(symbols)))
+        relabeled_signals = signals_df.copy()
+        relabeled_signals["symbol"] = relabeled_signals["symbol"].map(mapping)
+        relabeled_prices = price_df.copy()
+        relabeled_prices["symbol"] = relabeled_prices["symbol"].map(mapping)
+        rows.append({"trial": trial, **_run(relabeled_signals, relabeled_prices)})
+
+    return pd.DataFrame(rows)
+
+
+def check_capacity(
+    conn: duckdb.DuckDBPyConnection,
+    strategy_name: str,
+    symbols: list[str],
+    start_date: str,
+    end_date: str,
+    worst_n: int = 5,
+    **strategy_params: object,
+) -> dict[str, object]:
+    """How liquid are the names this strategy actually trades?
+
+    WHY THIS EXISTS: a strategy can look fine in every backtest metric and
+    still be unexecutable at any real size if it concentrates in thinly
+    traded names -- the flat-percentage slippage/cost model every backtest
+    here uses cannot represent the market impact of trying to buy or sell a
+    meaningful fraction of a single day's volume. This was found for
+    ``illiquidity_tilt`` only after it had already been written up as a
+    production candidate (see ``candidates/illiquidity_tilt.md``'s
+    "quantified capacity problem") -- checking it up front is cheap.
+
+    Computes each bought symbol's own median daily traded value (``close
+    x volume``, over its FULL available history, not just this window --
+    a strategy-blind, symbol-level liquidity baseline) and summarizes the
+    distribution across every symbol the strategy actually bought at least
+    once in ``[start_date, end_date]``.
+
+    Returns:
+        ``distinct_symbols_bought``, ``median_dollar_volume_percentiles``
+        (a dict of the 10/25/50/75/90th percentiles, in rupees), and
+        ``worst_n_names`` (a dict of the ``worst_n`` least liquid symbols
+        actually bought, mapped to their own median daily traded value).
+    """
+    history = _load_ohlcv_history(conn, symbols, end_date)
+    strategy = get_strategy(strategy_name)(**strategy_params)
+    signals_df = _filter_to_range(strategy.generate_signals(history), start_date, end_date)
+    buys = signals_df[signals_df["signal_type"] == "BUY"]
+    held_symbols = sorted(buys["symbol"].unique())
+
+    if not held_symbols:
+        return {"distinct_symbols_bought": 0, "median_dollar_volume_percentiles": {}, "worst_n_names": {}}
+
+    dollar_volume = history["close"] * history["volume"]
+    median_dv_by_symbol = dollar_volume.groupby(history["symbol"]).median()
+    held_dv = median_dv_by_symbol.reindex(held_symbols).dropna().sort_values()
+
+    percentiles = held_dv.quantile([0.1, 0.25, 0.5, 0.75, 0.9]).to_dict()
+    return {
+        "distinct_symbols_bought": len(held_symbols),
+        "median_dollar_volume_percentiles": percentiles,
+        "worst_n_names": held_dv.head(worst_n).to_dict(),
+    }
+
+
+def run_validation_gate(
+    conn: duckdb.DuckDBPyConnection,
+    strategy_name: str,
+    symbols: list[str],
+    max_concurrent_positions: int,
+    in_sample_fraction: float = 0.8,
+    order_sensitivity_trials: int = 40,
+    liquidity_worst_n: int = 5,
+    **strategy_params: object,
+) -> dict[str, object]:
+    """Run all three checks together and return one combined report.
+
+    Intended as the standard thing to run on ANY strategy before its
+    out-of-sample result is treated as a real finding -- see this
+    section's module-level comment for why each check exists. ``symbols``
+    and ``max_concurrent_positions`` are required, not defaulted, because
+    every prior capacity surprise in this project traced back to silently
+    reusing a cap sized for a different, smaller universe (e.g. 10,
+    matching a ~50-symbol Nifty 50 run, silently throttling a ~500-symbol
+    Nifty 500 run's real target basket) -- there is no safe default to
+    fall back to.
+
+    Returns:
+        A dict with ``window`` (the in-sample/out-of-sample split dates),
+        ``in_sample_metrics``, ``out_of_sample_metrics`` (both from the
+        real/alphabetical run), ``out_of_sample_benchmark`` (buy-and-hold
+        over the same out-of-sample window and universe),
+        ``order_sensitivity`` (the ``check_order_sensitivity`` DataFrame,
+        run on the out-of-sample window), and ``capacity`` (the
+        ``check_capacity`` dict, also over the out-of-sample window --
+        what a strategy would be trading NOW, not what it traded over the
+        full history).
+    """
+    full_start, in_sample_end, out_of_sample_start, full_end = compute_in_sample_split(conn, in_sample_fraction)
+
+    history = _load_ohlcv_history(conn, symbols, full_end)
+    strategy = get_strategy(strategy_name)(**strategy_params)
+
+    def _run_window(start: str, end: str) -> dict[str, object]:
+        price_df = bt._load_daily_prices(conn, symbols, start, end)
+        signals_df = _filter_to_range(strategy.generate_signals(history), start, end)
+        price_index = bt._build_price_index(price_df)
+        close_matrix = price_df.pivot(index="date", columns="symbol", values="close").sort_index().ffill()
+        scheduled = bt._schedule_executions(signals_df, price_index)
+        trades, equity_rows, _ = bt._simulate(
+            scheduled=scheduled,
+            price_index=price_index,
+            close_matrix=close_matrix,
+            initial_capital=INITIAL_CAPITAL,
+            slippage_pct=SLIPPAGE_PCT,
+            max_concurrent_positions=max_concurrent_positions,
+        )
+        trades_df = pd.DataFrame(trades)
+        equity_curve = pd.DataFrame(equity_rows).set_index("date") if equity_rows else pd.DataFrame()
+        return bt.calculate_metrics(trades_df, equity_curve, INITIAL_CAPITAL)
+
+    in_sample_metrics = _run_window(full_start, in_sample_end)
+    out_of_sample_metrics = _run_window(out_of_sample_start, full_end)
+    benchmark = compute_buy_and_hold_benchmark(history, out_of_sample_start, full_end)
+    order_sensitivity = check_order_sensitivity(
+        conn, strategy_name, symbols, out_of_sample_start, full_end, max_concurrent_positions,
+        trials=order_sensitivity_trials, **strategy_params,
+    )
+    capacity = check_capacity(
+        conn, strategy_name, symbols, out_of_sample_start, full_end, worst_n=liquidity_worst_n, **strategy_params
+    )
+
+    return {
+        "strategy_name": strategy_name,
+        "strategy_params": strategy_params,
+        "window": {
+            "full_start": full_start,
+            "in_sample_end": in_sample_end,
+            "out_of_sample_start": out_of_sample_start,
+            "full_end": full_end,
+        },
+        "in_sample_metrics": in_sample_metrics,
+        "out_of_sample_metrics": out_of_sample_metrics,
+        "out_of_sample_benchmark": benchmark,
+        "order_sensitivity": order_sensitivity,
+        "capacity": capacity,
+    }
+
+
+def print_validation_report(report: dict[str, object]) -> None:
+    """Print ``run_validation_gate``'s report in the same scannable style
+    as ``print_grid_results`` -- a verdict a human can read in one pass,
+    not just a dict to inspect in a debugger."""
+    name = report["strategy_name"]
+    window = report["window"]
+    is_m, oos_m, bh_m = report["in_sample_metrics"], report["out_of_sample_metrics"], report["out_of_sample_benchmark"]
+
+    print(f"\n=== Validation gate: {name} ({report['strategy_params']}) ===")
+    print(f"In-sample:     {window['full_start']} .. {window['in_sample_end']}")
+    print(f"Out-of-sample: {window['out_of_sample_start']} .. {window['full_end']}")
+    print(
+        f"\n{'':14s}{'CAGR':>10s}{'Sharpe':>10s}{'MaxDD':>10s}{'Trades':>10s}"
+    )
+    for label, m in [("In-sample", is_m), ("Out-of-sample", oos_m), ("OOS buy&hold", bh_m)]:
+        trades = m.get("total_trades", "-")
+        print(f"{label:14s}{m['cagr']:>9.2f}%{m['sharpe_ratio']:>10.2f}{m['max_drawdown_pct']:>9.2f}%{str(trades):>10s}")
+
+    sens = report["order_sensitivity"]
+    non_baseline = sens[sens["trial"] != 0]
+    baseline_sharpe = sens.loc[sens["trial"] == 0, "sharpe_ratio"].iloc[0]
+    beats_benchmark = (non_baseline["sharpe_ratio"] > bh_m["sharpe_ratio"]).mean()
+    print(
+        f"\nOrder sensitivity ({len(non_baseline)} random relabelings): "
+        f"Sharpe mean={non_baseline['sharpe_ratio'].mean():.2f} median={non_baseline['sharpe_ratio'].median():.2f} "
+        f"min={non_baseline['sharpe_ratio'].min():.2f} max={non_baseline['sharpe_ratio'].max():.2f} "
+        f"(real/alphabetical run: {baseline_sharpe:.2f})"
+    )
+    print(f"  -> {beats_benchmark:.0%} of random orderings beat the OOS buy-and-hold Sharpe ({bh_m['sharpe_ratio']:.2f}).")
+
+    cap = report["capacity"]
+    print(f"\nCapacity: {cap['distinct_symbols_bought']} distinct symbols bought OOS.")
+    if cap["median_dollar_volume_percentiles"]:
+        pct = cap["median_dollar_volume_percentiles"]
+        print("  Median daily traded value percentiles (Rs): " + ", ".join(f"p{int(k*100)}={v:,.0f}" for k, v in pct.items()))
+        worst = ", ".join(f"{sym}={v:,.0f}" for sym, v in cap["worst_n_names"].items())
+        print(f"  Least liquid names actually bought: {worst}")
+    print(f"\nNOTE: {OVERFIT_WARNING}")
 
 
 if __name__ == "__main__":
