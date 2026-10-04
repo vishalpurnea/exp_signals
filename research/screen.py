@@ -31,7 +31,7 @@ from research.decile_analysis import bucket_by_decile, plot_decile_returns, summ
 from research.forward_returns import compute_and_store_forward_returns, ensure_forward_returns_schema
 from research.ic_analysis import calculate_ic, plot_ic_over_time, summarize_ic
 from research.signal_library import available_signals, get_signal
-from src.earnings import attach_earnings_features, attach_trailing_eps, load_earnings_history
+from src.earnings import attach_earnings_features, attach_eps_growth, attach_trailing_eps, load_earnings_history
 from src.universe import DEFAULT_DB_PATH, get_active_universe
 
 DAILY_TIMEFRAME: str = "1d"
@@ -96,10 +96,12 @@ def _load_ohlcv_history(conn: duckdb.DuckDBPyConnection, symbols: list[str], end
 
     Also attaches each symbol's own earnings-event features
     (``last_earnings_surprise_pct``, ``trading_days_since_earnings`` --
-    see ``src.earnings.attach_earnings_features``) and trailing-twelve-month
+    see ``src.earnings.attach_earnings_features``), trailing-twelve-month
     EPS (``trailing_ttm_eps`` -- see ``src.earnings.attach_trailing_eps``),
-    the same way ``validate_strategy.py``'s own loader attaches the Nifty
-    market regime: unconditionally, inert (all-NaN) for any symbol with no
+    and year-over-year trailing-EPS growth (``trailing_eps_growth_yoy`` --
+    see ``src.earnings.attach_eps_growth``), the same way
+    ``validate_strategy.py``'s own loader attaches the Nifty market
+    regime: unconditionally, inert (all-NaN) for any symbol with no
     fetched earnings history, so every EXISTING signal is unaffected and
     simply never reads the new columns.
     """
@@ -116,7 +118,8 @@ def _load_ohlcv_history(conn: duckdb.DuckDBPyConnection, symbols: list[str], end
     df["date"] = pd.to_datetime(df["date"]).dt.normalize()
     earnings_df = load_earnings_history(conn, symbols)
     df = attach_earnings_features(df, earnings_df)
-    return attach_trailing_eps(df, earnings_df)
+    df = attach_trailing_eps(df, earnings_df)
+    return attach_eps_growth(df, earnings_df)
 
 
 def _ensure_forward_returns(conn: duckdb.DuckDBPyConnection, symbols: list[str]) -> None:

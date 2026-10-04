@@ -18,6 +18,7 @@ from research.signal_library import (
     bb_position,
     cross_sectional_rank_momentum,
     earnings_yield,
+    eps_growth,
     get_signal,
     intraday_return,
     momentum,
@@ -74,6 +75,7 @@ def test_available_signals_includes_all_builtins():
         "overnight_return",
         "intraday_return",
         "earnings_yield",
+        "eps_growth",
     ):
         assert expected in names
 
@@ -541,6 +543,38 @@ def test_earnings_yield_zero_price_is_nan_not_a_crash():
     df = _ey_panel(trailing_ttm_eps=[10.0], adj_close=[0.0])
     result = earnings_yield(df, {})
     assert pd.isna(result.iloc[0])
+
+
+# ---------------------------------------------------------------------------
+# eps_growth
+# ---------------------------------------------------------------------------
+
+
+def _epsg_panel(trailing_eps_growth_yoy: list[float], symbol: str = "AAA") -> pd.DataFrame:
+    """Build a single-symbol panel with the pre-attached trailing_eps_growth_yoy
+    column eps_growth reads directly -- this signal does NOT compute the
+    join itself (src.earnings.attach_eps_growth does, called by
+    research/screen.py's own loader), matching earnings_yield's/
+    post_earnings_drift's precedent."""
+    dates = pd.date_range("2024-01-01", periods=len(trailing_eps_growth_yoy), freq="D")
+    return pd.DataFrame({"symbol": symbol, "date": dates, "trailing_eps_growth_yoy": trailing_eps_growth_yoy})
+
+
+def test_eps_growth_missing_column_raises():
+    df = pd.DataFrame({"symbol": ["A"], "date": [pd.Timestamp("2024-01-01")], "adj_close": [100.0]})
+    with pytest.raises(ValueError, match="trailing_eps_growth_yoy"):
+        eps_growth(df, {})
+
+
+def test_eps_growth_passes_the_attached_column_through_unchanged():
+    """eps_growth does no further computation of its own -- it's a thin
+    pass-through onto the already-attached column, so the signal's
+    values must equal that column's values exactly, sign included."""
+    df = _epsg_panel(trailing_eps_growth_yoy=[0.4, -0.25, float("nan")])
+    result = eps_growth(df, {})
+    assert result.iloc[0] == pytest.approx(0.4)
+    assert result.iloc[1] == pytest.approx(-0.25)
+    assert pd.isna(result.iloc[2])
 
 
 # ---------------------------------------------------------------------------

@@ -41,7 +41,7 @@ import pandas as pd
 
 import backtest as bt
 from strategies.registry import get_strategy
-from src.earnings import attach_earnings_features, attach_trailing_eps, load_earnings_history
+from src.earnings import attach_earnings_features, attach_eps_growth, attach_trailing_eps, load_earnings_history
 from src.market_regime import attach_market_regime, load_market_regime
 from src.universe import DEFAULT_DB_PATH, get_active_universe
 
@@ -132,9 +132,10 @@ def _load_ohlcv_history(
     a strategy that uses them behaves identically whether it's driven
     through the production pipeline or through this research tool. Also
     attaches each symbol's own earnings-event features (see
-    ``src.earnings.attach_earnings_features``) and trailing-twelve-month
-    EPS (see ``src.earnings.attach_trailing_eps``) the same way
-    ``research/screen.py``'s own loader does — unconditionally, inert
+    ``src.earnings.attach_earnings_features``), trailing-twelve-month EPS
+    (see ``src.earnings.attach_trailing_eps``), and year-over-year
+    trailing-EPS growth (see ``src.earnings.attach_eps_growth``) the same
+    way ``research/screen.py``'s own loader does — unconditionally, inert
     (all-NaN) for a symbol with no fetched earnings history, so this is
     additive, not a breaking change, for every strategy that doesn't
     declare those columns in ``required_columns``.
@@ -157,7 +158,8 @@ def _load_ohlcv_history(
     history = attach_market_regime(history, load_market_regime(conn))
     earnings_df = load_earnings_history(conn, symbols)
     history = attach_earnings_features(history, earnings_df)
-    return attach_trailing_eps(history, earnings_df)
+    history = attach_trailing_eps(history, earnings_df)
+    return attach_eps_growth(history, earnings_df)
 
 
 def _filter_to_range(signals_df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:

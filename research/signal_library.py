@@ -376,6 +376,52 @@ def earnings_yield(df: pd.DataFrame, params: dict) -> pd.Series:
     return signal.reindex(df.index)
 
 
+@register_signal("eps_growth", default_params={})
+def eps_growth(df: pd.DataFrame, params: dict) -> pd.Series:
+    """Year-over-year trailing-twelve-month EPS growth rate -- a
+    fundamental MOMENTUM signal (is this company's earnings accelerating
+    or decelerating), as distinct from ``earnings_yield``'s static LEVEL
+    (is this company's current earnings cheap or expensive relative to
+    price). Tried specifically because ``earnings_yield`` screened as the
+    cleanest null result in this project (see ``PERFORMANCE.md``) --
+    testing whether the DIRECTION/RATE of change in fundamentals carries
+    information that the static level didn't, a different claim, not a
+    rerun of the same one.
+
+    Hypothesis, stated both ways since the literature itself disagrees:
+    EITHER accelerating earnings growth continues (a fundamental-momentum
+    effect, "an improving business keeps improving") OR a stock with
+    already-strong recent growth has priced-in high expectations that are
+    hard to keep beating (mean-reversion in growth rates, the flip side of
+    the same logic that motivates ``earnings_yield``'s value hypothesis).
+    The screen, not an assumption, decides which (if either) dominates.
+
+    NOT a true analyst-estimate-REVISION signal (did the Street's forward
+    estimate get raised/cut since last week) -- this project's data
+    source has no such time series; see ``src.earnings.attach_eps_growth``'s
+    own docstring for why a trailing-reported-EPS growth rate is the
+    closest feasible proxy instead.
+
+    Requires ``trailing_eps_growth_yoy`` already attached to ``df``
+    (``research/screen.py``'s own loader does this via
+    ``src.earnings.attach_eps_growth`` -- this signal does NOT compute
+    that join itself, same split as ``earnings_yield``/``post_earnings_drift``).
+    NaN wherever ``trailing_eps_growth_yoy`` is NaN (fewer than 8 reported
+    quarters on record, a zero prior-year TTM EPS, or no earnings data
+    for that symbol at all -- see ``attach_eps_growth``).
+    """
+    required = {"trailing_eps_growth_yoy"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"eps_growth requires columns: {sorted(missing)} -- attach via "
+            "src.earnings.attach_eps_growth (research/screen.py's own loader does this "
+            "automatically; raw OHLCV alone is not enough for this signal)."
+        )
+
+    return df["trailing_eps_growth_yoy"].reindex(df.index)
+
+
 def _adjusted_open(working: pd.DataFrame) -> pd.Series:
     """Raw ``open`` scaled by that SAME day's own ``adj_close / close`` ratio.
 

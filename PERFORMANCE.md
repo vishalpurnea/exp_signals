@@ -13,7 +13,7 @@ script's output) as of 2026-10-03 — see each strategy's own module docstring
 and `strategies/README.md` for the full methodology/caveats behind a number
 before trusting it in isolation.
 
-## ❌ `earnings_yield` — rejected at the screening stage, never built into a strategy (2026-10-04)
+## ❌ `earnings_yield` / `eps_growth` — both rejected at the screening stage, never built into a strategy (2026-10-04)
 
 Tried next, on direct request to look at a fundamental (P/E-style) signal.
 New data path: ``src.earnings.attach_trailing_eps`` sums the last 4
@@ -62,6 +62,45 @@ services company — this project has no sector/industry classification
 data at all), and Nifty 50 mega-caps may simply be too efficiently priced
 on this one measure for a value effect to show up without sector or
 peer-relative context.
+
+**Follow-up, on direct request: tried the fundamental-MOMENTUM version
+instead of the static level** — `eps_growth` (`src.earnings.attach_eps_growth`,
+year-over-year trailing-EPS growth: this quarter's trailing-12-month EPS
+vs. the same trailing-12-month figure 4 reports earlier, dividing by the
+absolute prior value so a negative base doesn't flip the sign
+nonsensically). Not a true analyst-estimate-revision signal — this
+project's data source has no history of how an estimate changed between
+reports, only the single estimate that existed at each one — so this is
+the closest feasible proxy, documented as such in the module docstring.
+
+| Horizon | 1d | 5d | 10d | 20d | 40d | 60d |
+|---|---|---|---|---|---|---|
+| Mean IC | 0.0063 | 0.0106 | 0.0119 | 0.0114 | 0.0090 | 0.0017 |
+| t-stat | 1.48 | 2.42 | 2.68 | 2.48 | 1.89 | 0.33 |
+
+A genuinely different shape from `earnings_yield`'s result — 5d/10d/20d
+all cross this project's own significance bar (\|t\| > 2) — but every
+horizon's IC magnitude (max 0.0119) sits well below the 0.02 floor
+`research/screen.py`'s own verdict logic requires before calling anything
+even "weak but potentially real" (see `verdict_for`), so the tool's own
+"No meaningful edge detected" verdict held at every horizon regardless.
+The decile breakdown explains why a "significant" t-stat still isn't
+tradeable here: 20d's quintile mean forward returns are U-shaped (2.10%,
+1.50%, 1.60%, 1.53%, 1.81% — BOTH extremes beat the middle, not a clean
+"high growth wins" or "low growth wins" gradient), so the decile SPREAD
+(top minus bottom) is actually slightly negative (-0.29pp) despite the
+positive mean Spearman IC — a rank correlation can be small-but-positive
+from a U-shape without the quantile-basket strategy architecture every
+strategy in this project uses (top/bottom quantile, not "most extreme in
+either direction") ever being able to capture it. Splitting in-sample
+(2014-2022, 10d) vs. out-of-sample (2022-2026, 10d) confirmed this is
+noise, not signal: t-stat 1.59 (insignificant) in-sample, 2.95 (sig.) OOS,
+decile spread flipping sign between the two (-0.35pp → +0.10pp) — the
+full-period pooled significance is an artifact of averaging over enough
+days, not a stable effect replicated across sub-periods. Rejected at the
+screening stage for the same reason as `earnings_yield`: never crosses
+into economically meaningful territory, just with a noisier, more
+superficially tempting path to that same conclusion.
 
 ## ⚠ `intraday_reversal` — reconsidered after deeper validation (2026-10-04)
 

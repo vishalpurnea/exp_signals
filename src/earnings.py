@@ -293,3 +293,72 @@ def attach_trailing_eps(df: pd.DataFrame, earnings_df: pd.DataFrame) -> pd.DataF
         merged_frames.append(merged.drop(columns=["_event_date"]))
 
     return pd.concat(merged_frames, ignore_index=True)
+
+
+def attach_eps_growth(df: pd.DataFrame, earnings_df: pd.DataFrame) -> pd.DataFrame:
+    """Broadcast each symbol's point-in-time year-over-year trailing-EPS
+    growth rate onto every one of its own trading-day rows -- a
+    fundamental MOMENTUM feature (is this company's earnings
+    accelerating or decelerating), distinct from ``attach_trailing_eps``'s
+    static LEVEL (is this company's current earnings cheap or expensive
+    relative to price).
+
+    "True" analyst estimate-revision history (did the Street's forward
+    estimate for next quarter get raised or cut since last week) is NOT
+    available from this project's data source -- ``yfinance.get_earnings_dates``
+    returns only the single estimate that existed AT each report, not a
+    time series of how that estimate changed between reports -- so this
+    is a trailing-REPORTED-EPS growth rate, the closest feasible proxy,
+    not a revision signal in the stricter sense. Reuses
+    ``attach_trailing_eps``'s point-in-time TTM EPS construction rather
+    than reimplementing it, then compares it to itself 4 reports earlier
+    (same quarter, prior year -- avoids the seasonal noise a raw
+    single-quarter-over-single-quarter comparison would have).
+
+    Adds one column, ``trailing_eps_growth_yoy``: ``(ttm_eps_now -
+    ttm_eps_4_reports_ago) / abs(ttm_eps_4_reports_ago)``. Dividing by
+    the ABSOLUTE prior value, not the signed one, is deliberate: it keeps
+    the sign of the result matching the actual direction of change even
+    when the prior TTM EPS was itself negative (e.g. -10 improving to -5
+    reads as +50%, correctly "improving," not the swapped-sign nonsense a
+    naive percent-change formula would give here). NaN until a symbol
+    has at least 8 reported quarters on record (``attach_trailing_eps``'s
+    own 4-quarter minimum, PLUS 4 more to look back a year) -- a
+    further-tightened version of that function's own "needs enough
+    history" caveat -- and NaN for a symbol with no earnings data, or a
+    zero prior-year TTM EPS, at all.
+    """
+    working = df.copy()
+    working["date"] = pd.to_datetime(working["date"], errors="coerce").dt.normalize()
+
+    if earnings_df.empty:
+        working["trailing_eps_growth_yoy"] = float("nan")
+        return working
+
+    working = working.sort_values(["symbol", "date"]).reset_index(drop=True)
+    merged_frames: list[pd.DataFrame] = []
+    for symbol, group in working.groupby("symbol", sort=False):
+        events = earnings_df.loc[earnings_df["symbol"] == symbol, ["earnings_date", "eps_actual"]].sort_values(
+            "earnings_date"
+        ).copy()
+        if events.empty:
+            group = group.copy()
+            group["trailing_eps_growth_yoy"] = float("nan")
+            merged_frames.append(group)
+            continue
+
+        ttm_eps = events["eps_actual"].rolling(window=4, min_periods=4).sum()
+        ttm_eps_year_ago = ttm_eps.shift(4)
+        events["trailing_eps_growth_yoy"] = (ttm_eps - ttm_eps_year_ago) / ttm_eps_year_ago.abs().replace(
+            0, float("nan")
+        )
+        merged = pd.merge_asof(
+            group.sort_values("date"),
+            events.rename(columns={"earnings_date": "_event_date"}).loc[:, ["_event_date", "trailing_eps_growth_yoy"]],
+            left_on="date",
+            right_on="_event_date",
+            direction="backward",
+        )
+        merged_frames.append(merged.drop(columns=["_event_date"]))
+
+    return pd.concat(merged_frames, ignore_index=True)

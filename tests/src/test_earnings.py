@@ -16,6 +16,7 @@ import pytest
 import src.earnings as earnings_module
 from src.earnings import (
     attach_earnings_features,
+    attach_eps_growth,
     attach_trailing_eps,
     ensure_earnings_schema,
     fetch_and_store_earnings,
@@ -276,3 +277,95 @@ def test_attach_trailing_eps_empty_earnings_df_fails_open_to_nan():
     df = _panel("AAA", dates)
     result = attach_trailing_eps(df, pd.DataFrame(columns=["symbol", "earnings_date", "eps_actual"]))
     assert result["trailing_ttm_eps"].isna().all()
+
+
+# --- attach_eps_growth --------------------------------------------------
+
+
+def test_attach_eps_growth_requires_eight_reports_before_producing_a_value():
+    """Growth needs two full trailing-4-quarter windows (current + one
+    year ago) -- with exactly 8 reported quarters, only rows from the
+    8th report onward get a value; everything before is NaN. Hand-traced:
+    TTM at report 4 (idx3) = 1+2+3+4=10; TTM at report 8 (idx7) =
+    2+3+4+5=14; growth = (14-10)/10 = 0.40."""
+    dates = pd.date_range("2024-01-01", periods=25)
+    df = _panel("AAA", dates)
+    event_dates = pd.to_datetime(
+        ["2024-01-01", "2024-01-04", "2024-01-07", "2024-01-10", "2024-01-13", "2024-01-16", "2024-01-19", "2024-01-22"]
+    )
+    earnings = pd.DataFrame(
+        {"symbol": ["AAA"] * 8, "earnings_date": event_dates, "eps_actual": [1.0, 2.0, 3.0, 4.0, 2.0, 3.0, 4.0, 5.0]}
+    )
+
+    result = attach_eps_growth(df, earnings).set_index("date")["trailing_eps_growth_yoy"]
+    assert result.loc["2024-01-01":"2024-01-21"].isna().all()
+    assert (result.loc["2024-01-22":"2024-01-25"] - 0.40).abs().max() < 1e-9
+
+
+def test_attach_eps_growth_sign_tracks_direction_of_change_through_a_negative_base():
+    """Prior-year TTM EPS of -10.0 improving to -5.0 must read as a
+    POSITIVE 50% growth ("improving," the correct direction), not a
+    negative or nonsensical value from dividing by a signed negative
+    base -- the whole reason the denominator is abs(). Hand-traced: TTM
+    at report 4 (idx3) = -1-2-3-4 = -10; TTM at report 8 (idx7) =
+    -2-1-1-1 = -5; growth = (-5 - (-10)) / abs(-10) = 0.50."""
+    dates = pd.date_range("2024-01-01", periods=25)
+    df = _panel("AAA", dates)
+    event_dates = pd.to_datetime(
+        ["2024-01-01", "2024-01-04", "2024-01-07", "2024-01-10", "2024-01-13", "2024-01-16", "2024-01-19", "2024-01-22"]
+    )
+    earnings = pd.DataFrame(
+        {
+            "symbol": ["AAA"] * 8,
+            "earnings_date": event_dates,
+            "eps_actual": [-1.0, -2.0, -3.0, -4.0, -2.0, -1.0, -1.0, -1.0],
+        }
+    )
+
+    result = attach_eps_growth(df, earnings).set_index("date")["trailing_eps_growth_yoy"]
+    assert (result.loc["2024-01-22":"2024-01-25"] - 0.50).abs().max() < 1e-9
+
+
+def test_attach_eps_growth_zero_prior_year_ttm_is_nan_not_a_crash():
+    dates = pd.date_range("2024-01-01", periods=25)
+    df = _panel("AAA", dates)
+    event_dates = pd.to_datetime(
+        ["2024-01-01", "2024-01-04", "2024-01-07", "2024-01-10", "2024-01-13", "2024-01-16", "2024-01-19", "2024-01-22"]
+    )
+    earnings = pd.DataFrame(
+        {
+            "symbol": ["AAA"] * 8,
+            "earnings_date": event_dates,
+            # TTM at report 4 (idx3) = 1+1+1-3 = 0 -- the prior-year base this growth would divide by.
+            "eps_actual": [1.0, 1.0, 1.0, -3.0, 2.0, 3.0, 4.0, 5.0],
+        }
+    )
+
+    result = attach_eps_growth(df, earnings).set_index("date")["trailing_eps_growth_yoy"]
+    assert result.loc["2024-01-22":"2024-01-25"].isna().all()
+
+
+def test_attach_eps_growth_symbols_never_cross_contaminate():
+    dates = pd.date_range("2024-01-01", periods=5)
+    df = pd.concat([_panel("AAA", dates), _panel("BBB", dates)], ignore_index=True)
+    earnings = pd.DataFrame(
+        {
+            "symbol": ["AAA"] * 4,
+            "earnings_date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]),
+            "eps_actual": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+
+    result = attach_eps_growth(df, earnings)
+    bbb = result[result["symbol"] == "BBB"]
+    assert bbb["trailing_eps_growth_yoy"].isna().all()
+    # AAA also has no value yet -- only 4 reports, needs 8 -- but must not crash or cross-contaminate.
+    aaa = result[result["symbol"] == "AAA"]
+    assert aaa["trailing_eps_growth_yoy"].isna().all()
+
+
+def test_attach_eps_growth_empty_earnings_df_fails_open_to_nan():
+    dates = pd.date_range("2024-01-01", periods=3)
+    df = _panel("AAA", dates)
+    result = attach_eps_growth(df, pd.DataFrame(columns=["symbol", "earnings_date", "eps_actual"]))
+    assert result["trailing_eps_growth_yoy"].isna().all()
