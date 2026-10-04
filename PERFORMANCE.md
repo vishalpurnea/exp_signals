@@ -26,7 +26,7 @@ numbers:
 
 | Strategy | In-sample Sharpe (v2) | Out-of-sample Sharpe, v1 (original) | Out-of-sample Sharpe, v2 (re-run) | OOS buy-and-hold Sharpe |
 |---|---|---|---|---|
-| `trend_ladder` (Nifty 500) | 0.57 | 0.08 | **0.47** | 0.53 (Nifty 500) |
+| `trend_ladder` (Nifty 500) | 0.57 | 0.08 | **0.47 ⚠ see below** | 0.53 (Nifty 500) |
 | `illiquidity_tilt` (Nifty 50) | 1.36 | -0.14 | **0.21** | 0.31 (Nifty 50) |
 | `illiquidity_tilt` (Nifty 500) | 1.78 | 0.06 | **0.13** | 0.53 (Nifty 500) |
 | `bollinger_reversion` (Nifty 50) | 0.59 | -0.60 | **-0.36** | 0.31 (Nifty 50) |
@@ -35,16 +35,27 @@ numbers:
 **Revised conclusion: part of the original "five strategies all collapse
 out-of-sample, pointing to a market-wide dispersion regime" finding was a
 measurement artifact of the v1 engine bug, not purely a real regime
-effect.** Under v2, `trend_ladder` now shows a genuinely strong,
-real-looking out-of-sample result (Sharpe 0.47, nearly matching its own
-in-sample 0.57, and close to buy-and-hold's own OOS Sharpe) —
-qualitatively different from "broken." `illiquidity_tilt` goes from
-negative/near-zero to weakly-but-genuinely positive on both universes.
-`bollinger_reversion` and `precision_pullback` are still negative
-out-of-sample, improved but not fixed. The capacity/liquidity problem
-found on `illiquidity_tilt`'s Nifty 500 version (see
-`candidates/illiquidity_tilt.md`) is unaffected by the engine version and
-still applies.
+effect.** Under v2, `illiquidity_tilt` goes from negative/near-zero to
+weakly-but-genuinely positive on both universes. `bollinger_reversion`
+and `precision_pullback` are still negative out-of-sample, improved but
+not fixed. The capacity/liquidity problem found on `illiquidity_tilt`'s
+Nifty 500 version (see `candidates/illiquidity_tilt.md`) is unaffected by
+the engine version and still applies.
+
+**`trend_ladder`'s 0.47 OOS Sharpe does NOT hold up under critical review
+— see `candidates/trend_ladder.md`.** It looked like the strongest result
+in the project, but the same same-day-execution tie-break sensitivity the
+PR that fixed v2 flagged on a different window turns out to apply here
+too: checked directly via 40 random symbol-order relabelings of this
+exact out-of-sample run, the alphabetical ordering quoted above sits near
+the TOP of the resulting distribution (mean 0.27, median 0.29, max 0.49)
+— not one of the 40 reaches buy-and-hold's own OOS Sharpe (0.53), and
+neither does the alphabetical number being quoted as the headline result.
+The in-sample window is not similarly order-sensitive (alphabetical 0.57
+sits at the 40-trial median of 0.52), so this is specific to the
+out-of-sample window having few qualifying signals competing for 10
+slots, not a general engine flaw. Net: this is not a working strategy,
+it looked like one only because of an arbitrary tie-break rule.
 
 **The two dispersion-regime strategies were re-run under v2, with a
 genuinely different (and more encouraging, for one of them) result than
