@@ -25,4 +25,9 @@ Each writeup should cover, in plain language:
 
 This directory is a running log, not a one-time snapshot — update a
 strategy's file as new backtests or live-readiness findings come in,
-rather than only writing it once.
+rather than only writing it once. A strategy's own file living here is
+NOT a standing guarantee that it's still a live recommendation: a deeper
+follow-up check can downgrade one in place (see `intraday_reversal.md`,
+downgraded after a walk-forward and Nifty 500 check overturned its
+original single-split result) — always read the status line at the top
+of a file rather than assuming its presence here means "still good."

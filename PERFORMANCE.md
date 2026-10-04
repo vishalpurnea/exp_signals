@@ -9,7 +9,7 @@ turns out to have been measuring the wrong thing (e.g. the wrong universe).
 
 Numbers below were pulled from the persisted `backtest_runs` /
 `backtest_results` / `backtest_trades` tables (or, where noted, a research
-script's output) as of 2026-10-03 — see each strategy's own module docstring
+script's output) as of 2026-10-04 — see each strategy's own module docstring
 and `strategies/README.md` for the full methodology/caveats behind a number
 before trusting it in isolation.
 
