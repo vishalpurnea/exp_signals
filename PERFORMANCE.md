@@ -13,6 +13,31 @@ script's output) as of 2026-10-03 — see each strategy's own module docstring
 and `strategies/README.md` for the full methodology/caveats behind a number
 before trusting it in isolation.
 
+## ✅ `intraday_reversal` — the first production candidate (2026-10-04)
+
+After `illiquidity_tilt`, `trend_ladder`, `bollinger_reversion`,
+`precision_pullback`, `volatility_premium`, `dispersion_gated_reversion`,
+`regime_switching_allocator`, and `post_earnings_drift` all failed one
+check or another, `intraday_reversal` (Nifty 50, window=20,
+bottom_quantile=0.2, holding=60d — buy the bottom quintile by rolling
+20-day mean intraday [open-to-close] return) is the first to clear
+`validation_gate.py` cleanly on every axis:
+
+| | In-sample | Out-of-sample | OOS buy&hold |
+|---|---|---|---|
+| CAGR | 18.97% | **10.24%** | 9.52% |
+| Sharpe | 0.74 | **0.33** | 0.31 |
+
+Beats buy-and-hold OOS on both CAGR and Sharpe. Order-sensitivity: 65% of
+40 random same-day tie-break relabelings ALSO beat the OOS benchmark
+(every other strategy checked this way scored 0%), and the real
+alphabetical run sits slightly below the random-trial median, not at a
+lucky extreme. Capacity: every Nifty 50 name trades above ₹300M/day.
+In-sample parameter grid (window × bottom_quantile × holding period,
+3×3×3): Sharpe 0.54–0.85 in every cell, no sign flips. Full writeup,
+including the still-open risks (small edge margin, no stop-loss tried
+yet, one static OOS split), in `candidates/intraday_reversal.md`.
+
 ## ⚠ In-sample vs. out-of-sample
 
 Every strategy in this project was checked with the same 80/20 split

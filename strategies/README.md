@@ -3,25 +3,35 @@
 Each concrete strategy is a `Strategy` subclass (`strategies/base.py`) registered
 under a string name (`strategies/registry.py`). See `ARCHITECTURE.md` for the
 full module-by-module reference and dependency map; this file is specifically
-about **fidelity to source specs** — two of the seven registered strategies
-(`trend_ladder`, `precision_pullback`) were ported from external PDF write-ups
-that include their own published backtest, and each has parts of the written
-strategy that are *deliberately not implemented*. This is the single place
-that lists every one of those omissions in one table, so they're never
-silently assumed away when reading a backtest result off this repo's data —
-each is also documented in its strategy's own module docstring, but this file
-is the one to check first if you're comparing a run here against a source
-spec's published numbers.
+about **fidelity to source specs** — two of the thirteen registered
+strategies (`trend_ladder`, `precision_pullback`, plus `dispersion_gated_trend_ladder`,
+which wraps `trend_ladder` unmodified with an extra gate) were ported from
+external PDF write-ups that include their own published backtest, and each
+has parts of the written strategy that are *deliberately not implemented*.
+This is the single place that lists every one of those omissions in one
+table, so they're never silently assumed away when reading a backtest
+result off this repo's data — each is also documented in its strategy's
+own module docstring, but this file is the one to check first if you're
+comparing a run here against a source spec's published numbers.
 
-## `bollinger_reversion` and `illiquidity_tilt` — not ported from a source spec, so not in the tables below
+## Everything else — not ported from a source spec, so not in the tables below
 
-Unlike the other five, these two weren't ported from an external write-up
-— both were built directly from `research/screen.py` findings (see each
-one's own module docstring for its full validation trail: `bollinger_reversion`'s
-horizon/window sweeps and large-cap-vs-rest split; `illiquidity_tilt`'s
-exclude-the-winners and Nifty-500-dilution checks on `amihud_illiquidity`).
-There's no external "published" number to compare against or omit from, so
-neither has anything to add to the fidelity-tracking tables below.
+Every other registered strategy (`bollinger_reversion`, `illiquidity_tilt`,
+`volatility_premium`, `post_earnings_drift`, `intraday_reversal`,
+`dispersion_gated_reversion`, `regime_switching_allocator`, and the
+original `bollinger_breakout`/`rsi_mean_reversion`/`sma_crossover` demo
+strategies) was built directly from a `research/screen.py` finding or as
+a standalone research tool, not ported from an external write-up — see
+each one's own module docstring for its full validation trail, and
+`PERFORMANCE.md`/`candidates/` for how it actually performed. There's no
+external "published" number to compare against or omit from any of them,
+so none has anything to add to the fidelity-tracking tables below.
+
+The two cross-sectional strategies with the most involved validation
+trails, kept here as a worked example of the kind of detail to expect in
+each one's own docstring: `bollinger_reversion`'s horizon/window sweeps
+and large-cap-vs-rest split, and `illiquidity_tilt`'s exclude-the-winners
+and Nifty-500-dilution checks on `amihud_illiquidity`.
 
 Both are also architecturally different from the five ported/hand-written
 strategies — cross-sectional, relative-value rules rather than a per-symbol

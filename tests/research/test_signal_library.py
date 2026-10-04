@@ -18,7 +18,9 @@ from research.signal_library import (
     bb_position,
     cross_sectional_rank_momentum,
     get_signal,
+    intraday_return,
     momentum,
+    overnight_return,
     post_earnings_drift,
     register_signal,
     rsi_level,
@@ -68,6 +70,8 @@ def test_available_signals_includes_all_builtins():
         "cross_sectional_rank_momentum",
         "amihud_illiquidity",
         "post_earnings_drift",
+        "overnight_return",
+        "intraday_return",
     ):
         assert expected in names
 
@@ -480,3 +484,82 @@ def test_post_earnings_drift_value_tracks_the_most_recent_surprise_not_absolute(
     df = _pead_panel(days_since=[0], surprise=[-15.0])
     result = post_earnings_drift(df, {})
     assert result.iloc[0] == pytest.approx(-15.0)
+
+
+# ---------------------------------------------------------------------------
+# overnight_return / intraday_return
+# ---------------------------------------------------------------------------
+
+
+def _ovn_panel(open_: list[float], close: list[float], adj_close: list[float] | None = None, symbol: str = "AAA") -> pd.DataFrame:
+    dates = pd.date_range("2024-01-01", periods=len(open_), freq="D")
+    return pd.DataFrame(
+        {
+            "symbol": symbol,
+            "date": dates,
+            "open": open_,
+            "close": close,
+            "adj_close": adj_close if adj_close is not None else close,
+        }
+    )
+
+
+def test_overnight_return_missing_columns_raises():
+    df = pd.DataFrame({"symbol": ["A"], "date": [pd.Timestamp("2024-01-01")], "adj_close": [100.0]})
+    with pytest.raises(ValueError, match="open|close"):
+        overnight_return(df, {})
+
+
+def test_intraday_return_missing_columns_raises():
+    df = pd.DataFrame({"symbol": ["A"], "date": [pd.Timestamp("2024-01-01")], "adj_close": [100.0]})
+    with pytest.raises(ValueError, match="open|close"):
+        intraday_return(df, {})
+
+
+def test_overnight_return_hand_computed_no_adjustment():
+    """Day 0 close=100 (no adjustment that day), day 1 open=102, close=102
+    (also unadjusted) -- overnight gap = (102-100)/100 = 2% exactly."""
+    df = _ovn_panel(open_=[100.0, 102.0], close=[100.0, 102.0])
+    result = overnight_return(df, {"window": 1})
+    assert pd.isna(result.iloc[0])
+    assert result.iloc[1] == pytest.approx(0.02)
+
+
+def test_intraday_return_hand_computed_no_adjustment():
+    """Day 1: open=100, close=103, unadjusted -- intraday move =
+    (103-100)/100 = 3% exactly."""
+    df = _ovn_panel(open_=[100.0, 100.0], close=[100.0, 103.0])
+    result = intraday_return(df, {"window": 1})
+    assert result.iloc[1] == pytest.approx(0.03)
+
+
+def test_overnight_return_corrects_a_phantom_split_day_gap():
+    """Day 0 (pre-split): raw close 200, retroactively adjusted to 100 by a
+    later 2:1 split. Day 1 (post-split): raw open/close both 105, already
+    fully adjusted (adj_close == close). The naive raw-close gap
+    ((105-200)/200 = -47.5%) would be a phantom crash that's actually just
+    the split; the real, economically correct overnight return is
+    (105-100)/100 = +5% -- independently recomputed by hand (and cross-
+    checked against the naive wrong answer) before being hardcoded here.
+    """
+    df = _ovn_panel(open_=[200.0, 105.0], close=[200.0, 105.0], adj_close=[100.0, 105.0])
+    result = overnight_return(df, {"window": 1})
+    assert result.iloc[1] == pytest.approx(0.05)
+
+
+def test_overnight_and_intraday_are_computed_independently_per_symbol():
+    """Two symbols with different gap/intraday shapes on the same dates
+    must never cross-contaminate each other's rolling window."""
+    dates = pd.date_range("2024-01-01", periods=3, freq="D")
+    df = pd.concat(
+        [
+            _ovn_panel(open_=[100.0, 110.0, 110.0], close=[100.0, 110.0, 110.0], symbol="AAA"),
+            _ovn_panel(open_=[100.0, 90.0, 90.0], close=[100.0, 90.0, 90.0], symbol="BBB"),
+        ],
+        ignore_index=True,
+    )
+    overnight = overnight_return(df, {"window": 1})
+    aaa_overnight = overnight[df["symbol"] == "AAA"].reset_index(drop=True)
+    bbb_overnight = overnight[df["symbol"] == "BBB"].reset_index(drop=True)
+    assert aaa_overnight.iloc[1] == pytest.approx(0.10)
+    assert bbb_overnight.iloc[1] == pytest.approx(-0.10)

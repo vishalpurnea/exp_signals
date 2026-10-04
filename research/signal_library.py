@@ -332,6 +332,85 @@ def post_earnings_drift(df: pd.DataFrame, params: dict) -> pd.Series:
     return signal.reindex(df.index)
 
 
+def _adjusted_open(working: pd.DataFrame) -> pd.Series:
+    """Raw ``open`` scaled by that SAME day's own ``adj_close / close`` ratio.
+
+    There is no ``adj_open`` column in this project's OHLCV schema, but the
+    overnight/intraday split below needs one: it spans a day boundary
+    (yesterday's close to today's open), and on a split/bonus date the raw
+    ``open`` and the PRIOR day's raw ``close`` sit on different price
+    scales, which would show up as a phantom multi-X "overnight return"
+    that's actually just the split -- not a new problem, the exact same
+    one ``strategies/trend_ladder.py``'s ``_compute_adx`` already solved
+    for high/low, solved the identical way here for open.
+    """
+    ratio = (working["adj_close"] / working["close"].replace(0, float("nan"))).fillna(1.0)
+    return working["open"] * ratio
+
+
+@register_signal("overnight_return", default_params={"window": 20})
+def overnight_return(df: pd.DataFrame, params: dict) -> pd.Series:
+    """Rolling N-day mean of the OVERNIGHT return: yesterday's close to
+    today's open, as a fraction of yesterday's close.
+
+    Hypothesis: the overnight gap is when information arriving outside
+    trading hours (news, earnings, overseas market moves, analyst actions)
+    first gets priced in, largely by informed/institutional order flow
+    reacting at the open -- structurally different from the intraday
+    session, which is dominated by liquidity/retail trading noise (see
+    ``intraday_return``, screened alongside this one specifically to
+    compare which component -- if either -- actually predicts forward
+    returns, rather than assuming total daily return is one undifferentiated
+    thing). Uses an adjusted open (see ``_adjusted_open``) since this
+    return spans a day boundary, where a raw open/close mismatch on a
+    split date would otherwise show up as a phantom gap.
+    """
+    window = params.get("window", 20)
+    required = {"symbol", "date", "open", "close", "adj_close"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"overnight_return requires columns: {sorted(missing)}")
+
+    working = _sorted_working(df)
+    adj_open = _adjusted_open(working)
+    prev_close = working.groupby("symbol")["adj_close"].shift(1)
+    daily_overnight = (adj_open - prev_close) / prev_close.replace(0, float("nan"))
+    signal = daily_overnight.groupby(working["symbol"]).transform(
+        lambda s: s.rolling(window=window, min_periods=window).mean()
+    )
+    return signal.reindex(df.index)
+
+
+@register_signal("intraday_return", default_params={"window": 20})
+def intraday_return(df: pd.DataFrame, params: dict) -> pd.Series:
+    """Rolling N-day mean of the INTRADAY return: today's open to today's
+    close, as a fraction of today's open.
+
+    Hypothesis: the trading session itself, as distinct from the overnight
+    gap (see ``overnight_return``'s docstring for the full comparison), is
+    typically where liquidity/retail order flow and noise trading dominate
+    -- if the overnight component carries genuine information-driven
+    predictability, the intraday component screening WEAKER (or with a
+    different sign) is itself informative, not just a null result. Both
+    legs use same-day prices only, so no cross-day adjustment mismatch is
+    possible here (unlike ``overnight_return``) -- the adjusted open is
+    still used, purely for internal consistency between the two signals.
+    """
+    window = params.get("window", 20)
+    required = {"symbol", "date", "open", "close", "adj_close"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"intraday_return requires columns: {sorted(missing)}")
+
+    working = _sorted_working(df)
+    adj_open = _adjusted_open(working)
+    daily_intraday = (working["adj_close"] - adj_open) / adj_open.replace(0, float("nan"))
+    signal = daily_intraday.groupby(working["symbol"]).transform(
+        lambda s: s.rolling(window=window, min_periods=window).mean()
+    )
+    return signal.reindex(df.index)
+
+
 @register_signal("cross_sectional_rank_momentum", default_params={"window": 20})
 def cross_sectional_rank_momentum(df: pd.DataFrame, params: dict) -> pd.Series:
     """Momentum expressed as each stock's percentile rank across the universe that day.
