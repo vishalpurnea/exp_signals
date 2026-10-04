@@ -14,6 +14,15 @@ Usage::
         --max-concurrent-positions 10 --params "window=20,top_quantile=0.2" \\
         --trials 40 --worst-n 5
 
+    # Also check the chosen config across several independent historical
+    # windows, not just the one static 80/20 split (see
+    # validate_strategy.run_walk_forward_test -- found intraday_reversal's
+    # headline out-of-sample win was 1 good period out of 6, see
+    # candidates/intraday_reversal.md):
+    python validation_gate.py --strategy intraday_reversal --universe nifty50 \\
+        --max-concurrent-positions 10 --params "holding_period_days=60" \\
+        --walk-forward-windows 6
+
 An intentionally independent CLI tool, same footing as ``backtest_cli.py``
 and ``research/screen.py`` (see ``ARCHITECTURE.md``) -- ``_parse_params``
 is reimplemented locally rather than imported, matching both of those.
@@ -85,6 +94,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--in-sample-fraction", type=float, default=0.8)
     parser.add_argument("--trials", type=int, default=40, help="Order-sensitivity random relabelings.")
     parser.add_argument("--worst-n", type=int, default=5, help="Least-liquid names to report by name.")
+    parser.add_argument(
+        "--walk-forward-windows", type=int, default=None,
+        help="If set, also run validate_strategy.run_walk_forward_test with this many independent "
+        "windows spanning the FULL history (see that function's docstring) -- a single 80/20 split "
+        "is one sample; this checks whether the chosen configuration holds up across several.",
+    )
     parser.add_argument("--db-path", default=str(DEFAULT_DB_PATH))
     args = parser.parse_args(argv)
 
@@ -107,6 +122,13 @@ def main(argv: list[str] | None = None) -> int:
             **params,
         )
         vs.print_validation_report(report)
+
+        if args.walk_forward_windows is not None:
+            wf_results = vs.run_walk_forward_test(
+                conn, args.strategy, symbols, max_concurrent_positions=args.max_concurrent_positions,
+                n_windows=args.walk_forward_windows, **params,
+            )
+            vs.print_walk_forward_report(wf_results)
     finally:
         conn.close()
     return 0

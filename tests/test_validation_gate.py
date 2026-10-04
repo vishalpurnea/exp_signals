@@ -248,3 +248,87 @@ def test_print_validation_report_does_not_crash(capsys):
     vs.print_validation_report(report)
     captured = capsys.readouterr()
     assert "sma_crossover" in captured.out
+
+
+# --- compute_walk_forward_windows / run_walk_forward_test --------------------
+
+
+def test_compute_walk_forward_windows_covers_full_history_no_gaps_no_overlap():
+    """4 windows over 20 trading days must partition the whole range --
+    first window starts on the first trading day, last window ends on the
+    last, and each window's end is immediately followed by the next
+    window's start (no gap, no overlap)."""
+    conn = make_conn()
+    dates = pd.date_range("2024-01-01", periods=20)
+    _insert(conn, "AAA", dates, [100] * 20)
+
+    windows = vs.compute_walk_forward_windows(conn, n_windows=4)
+    assert len(windows) == 4
+    assert windows[0][0] == dates[0].strftime("%Y-%m-%d")
+    assert windows[-1][1] == dates[-1].strftime("%Y-%m-%d")
+
+    for (_, end), (next_start, _) in zip(windows, windows[1:]):
+        end_idx = dates.get_loc(pd.Timestamp(end))
+        next_start_idx = dates.get_loc(pd.Timestamp(next_start))
+        assert next_start_idx == end_idx + 1
+
+
+def test_compute_walk_forward_windows_rejects_too_few_windows():
+    conn = make_conn()
+    dates = pd.date_range("2024-01-01", periods=5)
+    _insert(conn, "AAA", dates, [100] * 5)
+    with pytest.raises(ValueError):
+        vs.compute_walk_forward_windows(conn, n_windows=1)
+
+
+def test_run_walk_forward_test_matches_manual_per_window_checks():
+    """Each window's metrics must agree exactly with independently calling
+    run_out_of_sample_test (for the strategy legs) and
+    compute_buy_and_hold_benchmark (for the benchmark legs) on that same
+    window -- a strong cross-check that run_walk_forward_test isn't
+    quietly loading a different window or a different symbol set."""
+    conn = make_conn()
+    dates = pd.date_range("2024-01-01", periods=20)
+    prices = [100, 100, 100, 110, 115, 112, 108, 104, 100, 100, 100, 100, 100, 110, 118, 122, 118, 112, 108, 104]
+    _insert(conn, "AAA", dates, prices)
+    seed_active_universe(conn, ["AAA"])
+
+    windows = vs.compute_walk_forward_windows(conn, n_windows=2)
+    results = vs.run_walk_forward_test(
+        conn, "sma_crossover", ["AAA"], max_concurrent_positions=10, n_windows=2, **_SMA
+    )
+    assert list(results["window"]) == [0, 1]
+
+    history = vs._load_ohlcv_history(conn, ["AAA"], windows[-1][1])
+    for i, (start, end) in enumerate(windows):
+        expected_oos = vs.run_out_of_sample_test(conn, "sma_crossover", start, end, **_SMA)
+        expected_bh = vs.compute_buy_and_hold_benchmark(history, start, end)
+        row = results.iloc[i]
+
+        assert row["total_trades"] == expected_oos["total_trades"]
+        if pd.notna(expected_oos["sharpe_ratio"]):
+            assert row["sharpe_ratio"] == pytest.approx(expected_oos["sharpe_ratio"], abs=1e-9)
+        assert row["benchmark_cagr"] == pytest.approx(expected_bh["cagr"], abs=1e-9)
+        if pd.notna(expected_bh["sharpe_ratio"]):
+            assert row["benchmark_sharpe"] == pytest.approx(expected_bh["sharpe_ratio"], abs=1e-9)
+
+
+def test_print_walk_forward_report_does_not_crash(capsys):
+    conn = make_conn()
+    dates = pd.date_range("2024-01-01", periods=20)
+    prices = [100, 100, 100, 110, 115, 112, 108, 104, 100, 100, 100, 100, 100, 110, 118, 122, 118, 112, 108, 104]
+    _insert(conn, "AAA", dates, prices)
+    seed_active_universe(conn, ["AAA"])
+
+    results = vs.run_walk_forward_test(
+        conn, "sma_crossover", ["AAA"], max_concurrent_positions=10, n_windows=2, **_SMA
+    )
+    vs.print_walk_forward_report(results)
+    captured = capsys.readouterr()
+    assert "Walk-forward" in captured.out
+
+
+def test_print_walk_forward_report_handles_empty_results(capsys):
+    vs.print_walk_forward_report(pd.DataFrame())
+    captured = capsys.readouterr()
+    assert "No walk-forward results" in captured.out

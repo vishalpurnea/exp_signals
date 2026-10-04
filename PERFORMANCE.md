@@ -13,30 +13,51 @@ script's output) as of 2026-10-03 — see each strategy's own module docstring
 and `strategies/README.md` for the full methodology/caveats behind a number
 before trusting it in isolation.
 
-## ✅ `intraday_reversal` — the first production candidate (2026-10-04)
+## ⚠ `intraday_reversal` — reconsidered after deeper validation (2026-10-04)
 
-After `illiquidity_tilt`, `trend_ladder`, `bollinger_reversion`,
-`precision_pullback`, `volatility_premium`, `dispersion_gated_reversion`,
-`regime_switching_allocator`, and `post_earnings_drift` all failed one
-check or another, `intraday_reversal` (Nifty 50, window=20,
-bottom_quantile=0.2, holding=60d — buy the bottom quintile by rolling
-20-day mean intraday [open-to-close] return) is the first to clear
-`validation_gate.py` cleanly on every axis:
+Originally logged here as "the first production candidate" (2026-10-04,
+same day): `intraday_reversal` (Nifty 50, window=20, bottom_quantile=0.2,
+holding=60d — buy the bottom quintile by rolling 20-day mean intraday
+[open-to-close] return) cleared `validation_gate.py`'s three checks
+cleanly on its one static 80/20 split:
 
 | | In-sample | Out-of-sample | OOS buy&hold |
 |---|---|---|---|
-| CAGR | 18.97% | **10.24%** | 9.52% |
-| Sharpe | 0.74 | **0.33** | 0.31 |
+| CAGR | 18.97% | 10.24% | 9.52% |
+| Sharpe | 0.74 | 0.33 | 0.31 |
 
-Beats buy-and-hold OOS on both CAGR and Sharpe. Order-sensitivity: 65% of
-40 random same-day tie-break relabelings ALSO beat the OOS benchmark
-(every other strategy checked this way scored 0%), and the real
-alphabetical run sits slightly below the random-trial median, not at a
-lucky extreme. Capacity: every Nifty 50 name trades above ₹300M/day.
-In-sample parameter grid (window × bottom_quantile × holding period,
-3×3×3): Sharpe 0.54–0.85 in every cell, no sign flips. Full writeup,
-including the still-open risks (small edge margin, no stop-loss tried
-yet, one static OOS split), in `candidates/intraday_reversal.md`.
+Beat buy-and-hold OOS on both CAGR and Sharpe; order-sensitivity (65% of
+40 random tie-break relabelings also beat the benchmark) and capacity
+(every Nifty 50 name above ₹300M/day) both checked out.
+
+**Following up on the three risks that writeup flagged as still open
+(stop-loss, a single OOS split, Nifty 500) reversed the verdict:**
+
+1. **Stop-loss tuning found nothing to add.** Grid-searched directly
+   against the real engine (5–30%, in-sample then OOS): the curve was
+   jagged, not monotonic, and the apparent OOS "winner" (10%, Sharpe
+   0.58) turned out to be a same-day tie-break artifact — the real run
+   sat above the entire 40-trial randomization distribution (max 0.57),
+   the same failure mode that sank `trend_ladder`. Stays un-stopped.
+2. **A 6-window walk-forward check (full 2013–2026 history, same
+   configuration, no re-optimization per window) found the original OOS
+   win was 1 good period out of 6, not a persistent edge** — it beat its
+   own buy-and-hold benchmark's Sharpe in only 2/6 windows, trailing in
+   the other 4 (confirmed genuine via per-window order-sensitivity, not
+   another tie-break artifact). Averaged across all 6, the CAGR gap vs.
+   buy-and-hold is slightly *negative*.
+3. **Nifty 500 fails outright**, the same way `illiquidity_tilt` and
+   `trend_ladder` did: OOS CAGR 2.81%/Sharpe -0.08 against a 14.68%/0.53
+   benchmark, 0% of 40 random orderings beating it either, and the same
+   long-tail micro-caps (GALLANTT, PFOCUS, JWL, TARIL) driving it.
+
+**Downgraded from "candidate for real capital."** The underlying
+`intraday_return` signal is still real and cleanly-shaped at the
+screening stage — only the specific fixed-rule strategy built on it, and
+specifically its generalization across time and universe, is what this
+follow-up overturned. Full numbers and the complete revised verdict in
+`candidates/intraday_reversal.md` (kept, not deleted, with the downgrade
+stated up front).
 
 ## ⚠ In-sample vs. out-of-sample
 

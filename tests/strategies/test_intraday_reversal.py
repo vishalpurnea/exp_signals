@@ -53,6 +53,8 @@ def _panel(spec: dict[str, dict[str, list]], start="2024-01-01") -> pd.DataFrame
         {"bottom_quantile": 0.0},
         {"bottom_quantile": 1.0},
         {"holding_period_days": 0},
+        {"stop_loss_pct": 0.0},
+        {"stop_loss_pct": -5.0},
     ],
 )
 def test_config_rejects_invalid_parameter(kwargs):
@@ -195,6 +197,133 @@ def test_split_day_does_not_create_a_phantom_intraday_return():
     # so NOBODY should trade (confirms no phantom spike pushed A alone
     # into, or out of, the bottom quantile around the split boundary).
     assert result.empty
+
+
+# --- Stop-loss ----------------------------------------------------------------
+
+
+def test_stop_loss_fires_before_scheduled_exit_on_breach():
+    """A enters at 95 (day 2, index 2), then drops to 80 on day 3 -- a
+    -15.8% move, breaching a 10% stop-loss before the scheduled exit
+    (day 2 + holding 2 = day 4) would otherwise fire. The SELL must land
+    on day 3, not day 4.
+
+    Would catch: the stop-loss check being skipped entirely, or checked
+    against the wrong reference price (e.g. yesterday's close instead of
+    the cycle's own entry price).
+    """
+    strat = IntradayReversalStrategy(**_SMALL, stop_loss_pct=10.0)
+    df = _panel(
+        {
+            "A": {"open": [100] * 4, "close": [95, 95, 95, 80]},
+            "B": {"open": [100] * 4, "close": [100] * 4},
+            "C": {"open": [100] * 4, "close": [100] * 4},
+        }
+    )
+    result = strat.generate_signals(df)
+    a_rows = result[result["symbol"] == "A"].sort_values("date").reset_index(drop=True)
+
+    assert list(a_rows["signal_type"]) == ["BUY", "SELL"]
+    assert a_rows.iloc[0]["date"] == pd.Timestamp("2024-01-03")  # day 2: entry
+    assert a_rows.iloc[1]["date"] == pd.Timestamp("2024-01-04")  # day 3, NOT day 4
+    assert a_rows.iloc[1]["price"] == pytest.approx(80.0)
+    assert "Stop-loss" in a_rows.iloc[1]["reason"]
+
+
+def test_stop_loss_exact_boundary_is_inclusive():
+    """Exactly -10% from the 95 entry (85.5) must trigger (the check is
+    <=, not <); -9% (86.45) must not, letting the position continue to
+    its scheduled exit instead.
+
+    Would catch: an off-by-a-sign or strict-inequality mistake at the
+    exact threshold.
+    """
+    exact = IntradayReversalStrategy(**_SMALL, stop_loss_pct=10.0)
+    df_exact = _panel(
+        {
+            "A": {"open": [100] * 4, "close": [95, 95, 95, 85.5]},
+            "B": {"open": [100] * 4, "close": [100] * 4},
+            "C": {"open": [100] * 4, "close": [100] * 4},
+        }
+    )
+    result_exact = exact.generate_signals(df_exact)
+    a_exact = result_exact[result_exact["symbol"] == "A"].sort_values("date").reset_index(drop=True)
+    assert a_exact.iloc[1]["date"] == pd.Timestamp("2024-01-04")  # day 3: stopped out
+    assert "Stop-loss" in a_exact.iloc[1]["reason"]
+
+    just_above = IntradayReversalStrategy(**_SMALL, stop_loss_pct=10.0)
+    df_above = _panel(
+        {
+            "A": {"open": [100] * 5, "close": [95, 95, 95, 86.45, 90]},
+            "B": {"open": [100] * 5, "close": [100] * 5},
+            "C": {"open": [100] * 5, "close": [100] * 5},
+        }
+    )
+    result_above = just_above.generate_signals(df_above)
+    a_above = result_above[result_above["symbol"] == "A"].sort_values("date").reset_index(drop=True)
+    assert a_above.iloc[1]["date"] == pd.Timestamp("2024-01-05")  # day 4: scheduled exit, not stopped early
+    assert "Stop-loss" not in a_above.iloc[1]["reason"]
+
+
+def test_stop_loss_resets_cycle_allowing_fresh_entry():
+    """After a stop-loss exit, the symbol must be eligible for a fresh
+    entry on a later qualifying day, not permanently locked out.
+
+    The daily intraday-return formula (``close/open - 1``) is algebraically
+    independent of ``adj_close`` (the two ``adj_close`` terms in the
+    adjusted-open ratio cancel out -- confirmed by direct derivation), so
+    ``adj_close`` can crash on day 3 to breach the stop-loss WITHOUT also
+    dragging the rolling intraday-return ranking negative -- day 3's own
+    open/close is set to +5% specifically to offset day 2's -5% out of the
+    window=3 rolling average at day 4 (keeping day 4-6 tied at 0%, i.e.
+    NOT in the bottom quantile), isolating "does the cycle reset" from
+    "does the ranking happen to re-qualify immediately."
+
+    Would catch: the stop-loss SELL not resetting in_cycle/entry_idx/entry_price.
+    """
+    strat = IntradayReversalStrategy(**_SMALL, stop_loss_pct=10.0)
+    df = _panel(
+        {
+            "A": {
+                "open": [100, 100, 100, 100, 100, 100, 100, 100],
+                "close": [95, 95, 95, 105, 100, 100, 100, 95],
+                "adj_close": [95, 95, 95, 80, 100, 100, 100, 95],
+            },
+            "B": {"open": [100] * 8, "close": [100] * 8},
+            "C": {"open": [100] * 8, "close": [100] * 8},
+        }
+    )
+    result = strat.generate_signals(df)
+    a_rows = result[result["symbol"] == "A"].sort_values("date").reset_index(drop=True)
+
+    assert list(a_rows["signal_type"]) == ["BUY", "SELL", "BUY"]
+    assert a_rows.iloc[1]["reason"].startswith("Stop-loss")
+    assert a_rows.iloc[2]["date"] == pd.Timestamp("2024-01-08")  # day 7: fresh entry allowed
+    assert a_rows.iloc[2]["price"] == pytest.approx(95.0)
+
+
+def test_stop_loss_coinciding_with_scheduled_exit_emits_only_one_sell():
+    """If the stop-loss breach happens to land on the exact day the
+    fixed holding period would also end, exactly one SELL must be
+    emitted (the stop-loss), never two.
+
+    Would catch: checking the scheduled-exit condition without excluding
+    the stop-loss condition, double-emitting a SELL on the same date.
+    """
+    strat = IntradayReversalStrategy(**_SMALL, stop_loss_pct=10.0)
+    df = _panel(
+        {
+            # entry day2 @95; scheduled exit = day2 + holding 2 = day4.
+            # day4 also breaches -10% (95 -> 60 = -36.8%).
+            "A": {"open": [100] * 5, "close": [95, 95, 95, 95, 60]},
+            "B": {"open": [100] * 5, "close": [100] * 5},
+            "C": {"open": [100] * 5, "close": [100] * 5},
+        }
+    )
+    result = strat.generate_signals(df)
+    a_sells = result[(result["symbol"] == "A") & (result["signal_type"] == "SELL")]
+    assert len(a_sells) == 1
+    assert "Stop-loss" in a_sells.iloc[0]["reason"]
 
 
 # --- Output contract ----------------------------------------------------------

@@ -174,29 +174,7 @@ def _backtest_signals(signals_df: pd.DataFrame, price_df: pd.DataFrame) -> dict[
     and ``store_backtest_results`` (nothing here is a production backtest
     run worth persisting — this is a research tool).
     """
-    if signals_df.empty or price_df.empty:
-        trades_df = pd.DataFrame()
-        equity_curve = pd.DataFrame()
-    else:
-        price_index = bt._build_price_index(price_df)
-        close_matrix = (
-            price_df.pivot(index="date", columns="symbol", values="close").sort_index().ffill()
-        )
-        scheduled = bt._schedule_executions(signals_df, price_index)
-        trades, equity_rows, _skipped = bt._simulate(
-            scheduled=scheduled,
-            price_index=price_index,
-            close_matrix=close_matrix,
-            initial_capital=INITIAL_CAPITAL,
-            slippage_pct=SLIPPAGE_PCT,
-            max_concurrent_positions=MAX_CONCURRENT_POSITIONS,
-        )
-        trades_df = pd.DataFrame(trades)
-        equity_curve = pd.DataFrame(equity_rows)
-        if not equity_curve.empty:
-            equity_curve = equity_curve.set_index("date")
-
-    return bt.calculate_metrics(trades_df, equity_curve, INITIAL_CAPITAL)
+    return _backtest_signals_with_cap(signals_df, price_df, MAX_CONCURRENT_POSITIONS)
 
 
 def run_parameter_grid(
@@ -628,6 +606,158 @@ def run_validation_gate(
         "order_sensitivity": order_sensitivity,
         "capacity": capacity,
     }
+
+
+def compute_walk_forward_windows(
+    conn: duckdb.DuckDBPyConnection,
+    n_windows: int = 6,
+) -> list[tuple[str, str]]:
+    """Split the full available trading-day history into ``n_windows``
+    consecutive, non-overlapping, roughly-equal test periods.
+
+    WHY THIS EXISTS: every strategy in this project (``intraday_reversal``
+    included) has so far only ever been checked against ONE static
+    in-sample/out-of-sample split (see ``compute_in_sample_split``) — a
+    real, non-overfit result on that one split is still a result on one
+    sample. This produces several independent out-of-sample-style windows
+    spanning the full history (including the years ``compute_in_sample_split``
+    would have called "in-sample"), so a strategy's manually-chosen
+    parameters can be checked for consistency across different market
+    regimes (e.g. 2013-2015 vs. the COVID crash vs. 2023-2026), not just one
+    arbitrarily-placed boundary. Deliberately NOT re-optimizing parameters
+    per window — that would reintroduce the multiple-comparisons trap this
+    module's own docstring warns about; this tests whether ONE already-chosen
+    configuration holds up across time, the same spirit as
+    ``run_out_of_sample_test``, repeated across several periods instead of one.
+
+    Args:
+        conn: Open DuckDB connection.
+        n_windows: Number of equal-sized (by trading-day count, not
+            calendar time) consecutive periods to split the full history
+            into. Must be at least 2.
+
+    Returns:
+        ``n_windows`` ``(start, end)`` ISO date string tuples, covering the
+        full available history with no gaps and no overlap.
+    """
+    if n_windows < 2:
+        raise ValueError(f"n_windows must be at least 2, got {n_windows}")
+
+    trading_days = conn.execute(
+        "SELECT DISTINCT timestamp::DATE AS date FROM ohlcv_data WHERE timeframe = '1d' ORDER BY date"
+    ).df()["date"]
+    if trading_days.empty:
+        raise RuntimeError("No OHLCV data available to compute walk-forward windows.")
+    if len(trading_days) < n_windows:
+        raise RuntimeError(f"Only {len(trading_days)} trading days available for {n_windows} windows.")
+
+    boundaries = np.linspace(0, len(trading_days), n_windows + 1).round().astype(int)
+    windows: list[tuple[str, str]] = []
+    for i in range(n_windows):
+        start = trading_days.iloc[boundaries[i]].strftime("%Y-%m-%d")
+        end = trading_days.iloc[boundaries[i + 1] - 1].strftime("%Y-%m-%d")
+        windows.append((start, end))
+    return windows
+
+
+def run_walk_forward_test(
+    conn: duckdb.DuckDBPyConnection,
+    strategy_name: str,
+    symbols: list[str],
+    max_concurrent_positions: int,
+    n_windows: int = 6,
+    **strategy_params: object,
+) -> pd.DataFrame:
+    """Run one manually-chosen strategy configuration independently across
+    several consecutive time windows spanning the FULL available history.
+
+    See ``compute_walk_forward_windows`` for why this exists and what it
+    deliberately does NOT do (re-optimize per window). Each window is
+    backtested on its own (not cumulatively) using the shared engine, and
+    compared against its own buy-and-hold benchmark over the same window
+    and universe — the relevant comparison is "did this beat buy-and-hold
+    in most periods," not "is the average Sharpe high," since a strategy
+    that is only good in one unusual regime is not the same claim as one
+    that is consistently, if modestly, better.
+
+    ``symbols`` and ``max_concurrent_positions`` are required, same reason
+    as ``run_validation_gate``: no safe default to size a cap from.
+
+    Returns:
+        One row per window: ``window`` (0-indexed), ``start``, ``end``,
+        ``cagr``, ``sharpe_ratio``, ``max_drawdown_pct``, ``total_trades``,
+        ``benchmark_cagr``, ``benchmark_sharpe``.
+    """
+    windows = compute_walk_forward_windows(conn, n_windows)
+    history = _load_ohlcv_history(conn, symbols, windows[-1][1])
+    strategy = get_strategy(strategy_name)(**strategy_params)
+
+    rows: list[dict[str, object]] = []
+    for i, (start, end) in enumerate(windows):
+        price_df = bt._load_daily_prices(conn, symbols, start, end)
+        signals_df = _filter_to_range(strategy.generate_signals(history), start, end)
+        metrics = _backtest_signals_with_cap(signals_df, price_df, max_concurrent_positions)
+        benchmark = compute_buy_and_hold_benchmark(history, start, end)
+        rows.append(
+            {
+                "window": i,
+                "start": start,
+                "end": end,
+                "cagr": metrics["cagr"],
+                "sharpe_ratio": metrics["sharpe_ratio"],
+                "max_drawdown_pct": metrics["max_drawdown_pct"],
+                "total_trades": metrics.get("total_trades", 0),
+                "benchmark_cagr": benchmark["cagr"],
+                "benchmark_sharpe": benchmark["sharpe_ratio"],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _backtest_signals_with_cap(
+    signals_df: pd.DataFrame, price_df: pd.DataFrame, max_concurrent_positions: int
+) -> dict[str, object]:
+    """Like ``_backtest_signals``, but with an explicit (not the module-level
+    default) ``max_concurrent_positions`` -- shared by ``run_walk_forward_test``
+    and ``run_validation_gate``'s per-window runner."""
+    if signals_df.empty or price_df.empty:
+        trades_df = pd.DataFrame()
+        equity_curve = pd.DataFrame()
+    else:
+        price_index = bt._build_price_index(price_df)
+        close_matrix = price_df.pivot(index="date", columns="symbol", values="close").sort_index().ffill()
+        scheduled = bt._schedule_executions(signals_df, price_index)
+        trades, equity_rows, _skipped = bt._simulate(
+            scheduled=scheduled,
+            price_index=price_index,
+            close_matrix=close_matrix,
+            initial_capital=INITIAL_CAPITAL,
+            slippage_pct=SLIPPAGE_PCT,
+            max_concurrent_positions=max_concurrent_positions,
+        )
+        trades_df = pd.DataFrame(trades)
+        equity_curve = pd.DataFrame(equity_rows)
+        if not equity_curve.empty:
+            equity_curve = equity_curve.set_index("date")
+
+    return bt.calculate_metrics(trades_df, equity_curve, INITIAL_CAPITAL)
+
+
+def print_walk_forward_report(results: pd.DataFrame) -> None:
+    """Print ``run_walk_forward_test``'s per-window results plus a one-line
+    verdict (how many windows beat their own benchmark)."""
+    print("\n=== Walk-forward test (independent, non-overlapping windows) ===")
+    if results.empty:
+        print("No walk-forward results to display.")
+        return
+    print(
+        results.to_string(
+            index=False,
+            float_format=lambda value: f"{value:.3f}" if pd.notna(value) else "NaN",
+        )
+    )
+    beats = (results["sharpe_ratio"] > results["benchmark_sharpe"]).sum()
+    print(f"\n-> Beat its own buy-and-hold benchmark's Sharpe in {beats}/{len(results)} windows.")
 
 
 def print_validation_report(report: dict[str, object]) -> None:
